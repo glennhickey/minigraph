@@ -31,6 +31,8 @@ static ko_longopt_t long_options[] = {
 	{ "rmq",          ko_optional_argument, 307 },
 	{ "gg-min-end-cnt",  ko_required_argument, 309 },
 	{ "gg-min-end-frac", ko_required_argument, 310 },
+	{ "gg-min-inv-iden", ko_required_argument, 311 },
+	{ "gg-inv-cap-frac", ko_required_argument, 308 },
 	{ "no-comp-path", ko_no_argument,       312 },
 	{ "gg-match-pen", ko_required_argument, 313 },
 	{ "frag",         ko_no_argument,       314 },
@@ -149,6 +151,8 @@ int main(int argc, char *argv[])
 		else if (c == 301) opt.flag |= MG_M_VERTEX_COOR;      // --vc
 		else if (c == 309) gpt.ggs_min_end_cnt = atoi(o.arg);  // --gg-min-end-cnt
 		else if (c == 310) gpt.ggs_min_end_frac = atof(o.arg); // --gg-min-end-frac
+		else if (c == 311) gpt.ggs_min_inv_iden = atof(o.arg); // --gg-min-inv-iden
+		else if (c == 308) gpt.ggs_inv_cap_frac = atof(o.arg); // --gg-inv-cap-frac
 		else if (c == 312) opt.flag |= MG_M_NO_COMP_PATH;     // --no-comp-path
 		else if (c == 313) gpt.match_pen = atoi(o.arg);       // --gg-match-pen
 		else if (c == 314) opt.flag |= MG_M_FRAG_MODE | MG_M_FRAG_MERGE;       // --frag
