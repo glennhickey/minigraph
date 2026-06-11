@@ -231,7 +231,7 @@ void mg_ggsimple(void *km, const mg_ggopt_t *opt, gfa_t *g, int32_t n_seq, const
 					if (n_ovlp != 1) break;
 				}
 				if (k <= le) continue;
-				if (pd - (I.coff[1] - I.coff[0]) < opt->min_var_len && (I.coff[1] - I.coff[0]) - pd < opt->min_var_len) { // if length difference > min_var_len, just insert
+				if ((pd>(I.coff[1]-I.coff[0])?pd-(I.coff[1]-I.coff[0]):(I.coff[1]-I.coff[0])-pd) < (opt->min_var_len>(I.coff[1]-I.coff[0])/10?opt->min_var_len:(I.coff[1]-I.coff[0])/10)) { // if length difference > min_var_len, just insert
 					int32_t qd = I.coff[1] - I.coff[0], mlen, blen, score;
 					l_pseq = mg_path2seq(km, g, gt, ls, le, I.voff, &pseq, &m_pseq);
 					score = mg_wfa_cmp(km, l_pseq, pseq, qd, &seq[t].seq[I.coff[0]], 5000, &mlen, &blen);
@@ -240,7 +240,7 @@ void mg_ggsimple(void *km, const mg_ggopt_t *opt, gfa_t *g, int32_t n_seq, const
 						if (blen - mlen < opt->min_var_len * opt->ggs_max_iden) continue;
 					} else if (!(opt->flag & MG_G_NO_INV)) {
 						mg_revcomp_seq(l_pseq, pseq);
-						score = mg_wfa_cmp(km, l_pseq, pseq, qd, &seq[t].seq[I.coff[0]], 5000, &mlen, &blen);
+						score = mg_wfa_cmp(km, l_pseq, pseq, qd, &seq[t].seq[I.coff[0]], (qd/4>5000?qd/4:5000), &mlen, &blen);
 						if (score > 0 && mlen > blen * opt->ggs_min_inv_iden) is_inv = 1;
 					}
 				}
@@ -491,7 +491,7 @@ void mg_ggsimple_cigar(void *km, const mg_ggopt_t *opt, gfa_t *g, int32_t n_seq,
 					if (n_ovlp != 1) break;
 				}
 				if (k <= ie->lc) continue;
-				if (pd - (I.coff[1] - I.coff[0]) < opt->min_var_len && (I.coff[1] - I.coff[0]) - pd < opt->min_var_len) { // if length difference > min_var_len, just insert
+				if ((pd>(I.coff[1]-I.coff[0])?pd-(I.coff[1]-I.coff[0]):(I.coff[1]-I.coff[0])-pd) < (opt->min_var_len>(I.coff[1]-I.coff[0])/10?opt->min_var_len:(I.coff[1]-I.coff[0])/10)) { // if length difference > min_var_len, just insert
 					int32_t qd = I.coff[1] - I.coff[0], mlen, blen, score = 0;
 					l_pseq = mg_path2seq(km, g, gt, ls, le, I.voff, &pseq, &m_pseq);
 					score = mg_wfa_cmp(km, l_pseq, pseq, qd, &seq[t].seq[I.coff[0]], 5000, &mlen, &blen);
@@ -500,7 +500,7 @@ void mg_ggsimple_cigar(void *km, const mg_ggopt_t *opt, gfa_t *g, int32_t n_seq,
 						if (blen - mlen < opt->min_var_len * opt->ggs_max_iden) continue;
 					} else if (!(opt->flag & MG_G_NO_INV)) {
 						mg_revcomp_seq(l_pseq, pseq);
-						score = mg_wfa_cmp(km, l_pseq, pseq, qd, &seq[t].seq[I.coff[0]], 5000, &mlen, &blen);
+						score = mg_wfa_cmp(km, l_pseq, pseq, qd, &seq[t].seq[I.coff[0]], (qd/4>5000?qd/4:5000), &mlen, &blen);
 						if (score > 0 && mlen > blen * opt->ggs_min_inv_iden) is_inv = 1;
 					}
 				}
