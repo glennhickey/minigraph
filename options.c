@@ -61,6 +61,7 @@ void mg_ggopt_init(mg_ggopt_t *go)
 	go->ggs_max_iden = 0.80f;
 	go->ggs_min_inv_iden = 0.95f;
 	go->ggs_inv_cap_frac = 0.25f;
+	go->ggs_inv_step = 0;
 }
 
 int mg_opt_set(const char *preset, mg_idxopt_t *io, mg_mapopt_t *mo, mg_ggopt_t *go)

@@ -88,6 +88,7 @@ typedef struct {
 	float ggs_min_end_frac;
 	// scoring for SW check
 	float ggs_max_iden, ggs_min_inv_iden, ggs_inv_cap_frac;
+	int ggs_inv_step;
 } mg_ggopt_t;
 
 typedef struct {

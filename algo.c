@@ -174,7 +174,7 @@ int32_t mg_intv_overlap(void *km, int32_t n_a, const mg_intv_t *a, int32_t st, i
  * Global alignment *
  ********************/
 
-int32_t mg_wfa_cmp(void *km, int32_t l1, const char *s1, int32_t l2, const char *s2, int32_t max_pen, int32_t *mlen, int32_t *blen)
+int32_t mg_wfa_cmp(void *km, int32_t l1, const char *s1, int32_t l2, const char *s2, int32_t max_pen, int32_t step, int32_t *mlen, int32_t *blen)
 {
 	mwf_opt_t opt;
 	mwf_rst_t r;
@@ -182,6 +182,8 @@ int32_t mg_wfa_cmp(void *km, int32_t l1, const char *s1, int32_t l2, const char 
 	mwf_opt_init(&opt);
 	opt.max_s = max_pen;
 	opt.flag |= MWF_F_CIGAR;
+	if (step > 0) opt.step = step;             // --gg-inv-step: low-memory checkpointed WFA
+	else if (max_pen > 50000) opt.step = 1000; // safety net: bound huge-cap WFA memory
 	mwf_wfa_exact(km, &opt, l1, s1, l2, s2, &r);
 	*mlen = *blen = 0;
 	for (i = 0; i < r.n_cigar; ++i) {
