@@ -71,6 +71,35 @@ static void collect_minimizers(void *km, const mg_mapopt_t *opt, const mg_idx_t 
 	}
 }
 
+// Flag on a minimizer in mg128_v::y. Bits 32-39 hold the segment ID (at most MG_MAX_SEG), so bit 40 is free.
+#define MG_MINI_FLT (1ULL<<40)
+
+// Flag query minimizers that are highly repetitive in the query itself. Such a minimizer may still be rare in the
+// graph - e.g. a satellite array present in the query but masked with N in the reference - and would then pass the
+// occurrence filter in collect_matches() and generate a huge number of anchors. Cf. mm_seed_mz_flt() in minimap2;
+// unlike minimap2 we keep the minimizers and let collect_matches() treat them as repetitive, so that they still
+// count towards rep_len and thus towards mapping quality.
+static void mm_seed_mz_flt(void *km, mg128_v *mv, int32_t q_occ_max, float q_occ_frac)
+{
+	mg128_t *a;
+	size_t i, j, st;
+	if (mv->n <= (size_t)q_occ_max || q_occ_frac <= 0.0f || q_occ_max <= 0) return;
+	KMALLOC(km, a, mv->n);
+	for (i = 0; i < mv->n; ++i)
+		a[i].x = mv->a[i].x>>8, a[i].y = i; // the lowest 8 bits of x keep the k-mer span; collect_matches() keys on x>>8
+	radix_sort_128x(a, a + mv->n);
+	for (st = 0, i = 1; i <= mv->n; ++i) {
+		if (i == mv->n || a[i].x != a[st].x) {
+			int64_t cnt = i - st;
+			if (cnt > q_occ_max && cnt > mv->n * q_occ_frac)
+				for (j = st; j < i; ++j)
+					mv->a[a[j].y].y |= MG_MINI_FLT;
+			st = i;
+		}
+	}
+	kfree(km, a);
+}
+
 #include "ksort.h"
 #define heap_lt(a, b) ((a).x > (b).x)
 KSORT_INIT(heap, mg128_t, heap_lt)
@@ -91,11 +120,11 @@ static mg_match_t *collect_matches(void *km, int *_n_m, int max_occ, const mg_id
 	KMALLOC(km, *mini_pos, mv->n);
 	m = (mg_match_t*)kmalloc(km, mv->n * sizeof(mg_match_t));
 	for (i = 0, n_m = 0, *rep_len = 0, *n_a = 0; i < mv->n; ++i) {
-		const uint64_t *cr;
+		const uint64_t *cr = 0;
 		mg128_t *p = &mv->a[i];
 		uint32_t q_pos = (uint32_t)p->y, q_span = p->x & 0xff;
-		int t;
-		cr = mg_idx_get(gi, p->x>>8, &t);
+		int t = INT32_MAX; // a minimizer flagged by mm_seed_mz_flt() is repetitive by definition
+		if (!(p->y & MG_MINI_FLT)) cr = mg_idx_get(gi, p->x>>8, &t);
 		if (t >= max_occ) {
 			int en = (q_pos >> 1) + 1, st = en - q_span;
 			if (st > rep_en) {
@@ -104,7 +133,7 @@ static mg_match_t *collect_matches(void *km, int *_n_m, int max_occ, const mg_id
 			} else rep_en = en;
 		} else {
 			mg_match_t *q = &m[n_m++];
-			q->q_pos = q_pos, q->q_span = q_span, q->cr = cr, q->n = t, q->seg_id = p->y >> 32;
+			q->q_pos = q_pos, q->q_span = q_span, q->cr = cr, q->n = t, q->seg_id = p->y >> 32 & 0xff;
 			q->is_tandem = 0;
 			if (i > 0 && p->x>>8 == mv->a[i - 1].x>>8) q->is_tandem = 1;
 			if (i < mv->n - 1 && p->x>>8 == mv->a[i + 1].x>>8) q->is_tandem = 1;
@@ -391,6 +420,7 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	hash  = kh_hash_uint32(hash);
 
 	collect_minimizers(b->km, opt, gi, n_segs, qlens, seqs, &mv);
+	if (opt->q_occ_frac > 0.0f) mm_seed_mz_flt(b->km, &mv, opt->occ_max1, opt->q_occ_frac);
 	if (opt->flag & MG_M_HEAP_SORT) a = collect_seed_hits_heap(b->km, opt, opt->occ_max1, gi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
 	else a = collect_seed_hits(b->km, opt, opt->occ_max1, gi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
 

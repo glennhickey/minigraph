@@ -57,6 +57,7 @@ typedef struct {
 	int pe_ori;
 	int occ_max1, occ_max1_cap;
 	float occ_max1_frac;
+	float q_occ_frac;
 	int bw, bw_long;
 	int rmq_size_cap;
 	int rmq_rescue_size;

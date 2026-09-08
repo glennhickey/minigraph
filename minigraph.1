@@ -68,6 +68,24 @@ it will be the final threshold; otherwise the lower or the upper bound of
 .B -U
 will be applied.
 .TP
+.BI --q-occ-frac \ FLOAT
+Ignore a query minimizer if it occurs in more than
+.I FLOAT
+fraction of all minimizers of the query sequence, and more often than the
+minimizer occurrence threshold (see
+.B -f
+and
+.BR -U )
+[0; disabled]. This filters repeat arrays that are abundant in the query but
+not in the graph, for example a satellite array that the reference represents
+as a run of ambiguous bases. Such minimizers pass the graph-side occurrence
+filter and may generate a very large number of anchors. For chromosome-scale
+queries, 1e-4 is an effective setting; the read-oriented default of 0.01 used
+by minimap2 corresponds to tens of thousands of copies of one k-mer and never
+takes effect at this scale. The option has no effect when a query has fewer
+minimizers than the occurrence threshold, and therefore does not apply to
+short reads.
+.TP
 .BI --lc-threads \ INT
 Number of threads used to chain the anchors of one query sequence [0]. Linear
 chaining is independent for each (segment,strand) group of anchors, so it can
