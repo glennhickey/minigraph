@@ -5,6 +5,7 @@
 #include "mgpriv.h"
 #include "kalloc.h"
 #include "krmq.h"
+#include "kavl.h"
 
 static int64_t mg_chain_bk_end(int32_t max_drop, const mg128_t *z, const int32_t *f, const int64_t *p, int32_t *t, int64_t k)
 {
@@ -231,6 +232,16 @@ KRMQ_INIT(lc_elem, lc_elem_t, head, lc_elem_cmp, lc_elem_lt2)
 
 KALLOC_POOL_INIT(rmq, lc_elem_t)
 
+typedef struct lc_inode_s { // node of the inner tree; only the (y,i) order is needed, not RMQ
+	int32_t y, i;
+	KAVL_HEAD(struct lc_inode_s) head;
+} lc_inode_t;
+
+#define lc_inode_cmp(a, b) ((a)->y < (b)->y? -1 : (a)->y > (b)->y? 1 : ((a)->i > (b)->i) - ((a)->i < (b)->i))
+KAVL_INIT(lc_in, lc_inode_t, head, lc_inode_cmp)
+
+KALLOC_POOL_INIT(lcin, lc_inode_t)
+
 static inline int32_t comput_sc_simple(const mg128_t *ai, const mg128_t *aj, float chn_pen_gap, float chn_pen_skip, int32_t *exact, int32_t *width)
 {
 	int32_t dq = (int32_t)ai->y - (int32_t)aj->y, dr, dd, dg, q_span, sc;
@@ -255,9 +266,11 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 	int32_t *f,*t, *v, n_u, n_v, mmax_f = 0, max_rmq_size = 0, max_drop = bw;
 	int64_t *p, i, i0, st = 0, st_inner = 0, n_iter = 0;
 	uint64_t *u;
-	lc_elem_t *root = 0, *root_inner = 0;
-	void *mem_mp = 0;
+	lc_elem_t *root = 0;
+	lc_inode_t *root_inner = 0;
+	void *mem_mp = 0, *mem_mpi = 0;
 	kmp_rmq_t *mp;
+	kmp_lcin_t *mpi = 0;
 
 	if (_u) *_u = 0, *n_u_ = 0;
 	if (n == 0 || a == 0) {
@@ -272,12 +285,16 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 	KMALLOC(km, v, n);
 	mem_mp = km_init2(km, 0x10000);
 	mp = kmp_init_rmq(mem_mp);
+	if (max_dist_inner > 0) {
+		mem_mpi = km_init2(km, 0x10000);
+		mpi = kmp_init_lcin(mem_mpi);
+	}
 
 	// fill the score and backtrack arrays
 	for (i = i0 = 0; i < n; ++i) {
 		int64_t max_j = -1;
 		int32_t q_span = a[i].y>>32&0xff, max_f = q_span;
-		lc_elem_t s, *q, *r, lo, hi;
+		lc_elem_t s, *q, lo, hi;
 		// add in-range anchors
 		if (i0 < i && a[i0].x != a[i].x) {
 			int64_t j;
@@ -286,9 +303,9 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 				q->y = (int32_t)a[j].y, q->i = j, q->pri = -(f[j] + 0.5 * chn_pen_gap * ((int32_t)a[j].x + (int32_t)a[j].y));
 				krmq_insert(lc_elem, &root, q, 0);
 				if (max_dist_inner > 0) {
-					r = kmp_alloc_rmq(mp);
-					*r = *q;
-					krmq_insert(lc_elem, &root_inner, r, 0);
+					lc_inode_t *r = kmp_alloc_lcin(mpi);
+					r->y = q->y, r->i = j;
+					kavl_insert(lc_in, &root_inner, r, 0);
 				}
 			}
 			i0 = i;
@@ -296,19 +313,16 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 		// get rid of active chains out of range
 		while (st < i && (a[i].x>>32 != a[st].x>>32 || a[i].x > a[st].x + max_dist || krmq_size(head, root) > cap_rmq_size)) {
 			s.y = (int32_t)a[st].y, s.i = st;
-			if ((q = krmq_find(lc_elem, root, &s, 0)) != 0) {
-				q = krmq_erase(lc_elem, &root, q, 0);
+			if (root && (q = krmq_erase(lc_elem, &root, &s, 0)) != 0) // krmq_erase() searches for s itself
 				kmp_free_rmq(mp, q);
-			}
 			++st;
 		}
 		if (max_dist_inner > 0)  { // similar to the block above, but applied to the inner tree
-			while (st_inner < i && (a[i].x>>32 != a[st_inner].x>>32 || a[i].x > a[st_inner].x + max_dist_inner || krmq_size(head, root_inner) > cap_rmq_size)) {
+			while (st_inner < i && (a[i].x>>32 != a[st_inner].x>>32 || a[i].x > a[st_inner].x + max_dist_inner || kavl_size(head, root_inner) > cap_rmq_size)) {
+				lc_inode_t s, *q;
 				s.y = (int32_t)a[st_inner].y, s.i = st_inner;
-				if ((q = krmq_find(lc_elem, root_inner, &s, 0)) != 0) {
-					q = krmq_erase(lc_elem, &root_inner, q, 0);
-					kmp_free_rmq(mp, q);
-				}
+				if (root_inner && (q = kavl_erase(lc_in, &root_inner, &s, 0)) != 0)
+					kmp_free_lcin(mpi, q);
 				++st_inner;
 			}
 		}
@@ -322,33 +336,34 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 			sc = f[j] + comput_sc_simple(&a[i], &a[j], chn_pen_gap, chn_pen_skip, &exact, &width);
 			if (width <= bw && sc > max_f) max_f = sc, max_j = j;
 			if (!exact && root_inner && (int32_t)a[i].y > 0) {
-				lc_elem_t *lo, *hi;
+				lc_inode_t s;
+				const lc_inode_t *q;
+				int32_t width, n_rmq_iter = 0;
+				kavl_itr_t(lc_in) itr;
 				s.y = (int32_t)a[i].y - 1, s.i = n;
-				krmq_interval(lc_elem, root_inner, &s, &lo, &hi);
-				if (lo) {
-					const lc_elem_t *q;
-					int32_t width, n_rmq_iter = 0;
-					krmq_itr_t(lc_elem) itr;
-					krmq_itr_find(lc_elem, root_inner, lo, &itr);
-					while ((q = krmq_at(&itr)) != 0) {
-						if (q->y < (int32_t)a[i].y - max_dist_inner) break;
-						++n_rmq_iter;
-						j = q->i;
-						sc = f[j] + comput_sc_simple(&a[i], &a[j], chn_pen_gap, chn_pen_skip, 0, &width);
-						if (width <= bw) {
-							if (sc > max_f) {
-								max_f = sc, max_j = j;
-								if (n_skip > 0) --n_skip;
-							} else if (t[j] == (int32_t)i) {
-								if (++n_skip > max_chn_skip)
-									break;
-							}
-							if (p[j] >= 0) t[p[j]] = i;
+				kavl_itr_find(lc_in, root_inner, &s, &itr); // the iterator stops at the last node on the search path
+				q = kavl_at(&itr);
+				if (q && lc_inode_cmp(&s, q) < 0) // this node is larger than s; move to the largest node smaller than s
+					q = kavl_itr_prev(lc_in, &itr)? kavl_at(&itr) : 0;
+				while (q) {
+					if (q->y < (int32_t)a[i].y - max_dist_inner) break;
+					++n_rmq_iter;
+					j = q->i;
+					sc = f[j] + comput_sc_simple(&a[i], &a[j], chn_pen_gap, chn_pen_skip, 0, &width);
+					if (width <= bw) {
+						if (sc > max_f) {
+							max_f = sc, max_j = j;
+							if (n_skip > 0) --n_skip;
+						} else if (t[j] == (int32_t)i) {
+							if (++n_skip > max_chn_skip)
+								break;
 						}
-						if (!krmq_itr_prev(lc_elem, &itr)) break;
+						if (p[j] >= 0) t[p[j]] = i;
 					}
-					n_iter += n_rmq_iter;
+					if (!kavl_itr_prev(lc_in, &itr)) break;
+					q = kavl_at(&itr);
 				}
+				n_iter += n_rmq_iter;
 			}
 		}
 		// set max
@@ -360,6 +375,7 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 	}
 	if (mg_dbg_flag & MG_DBG_LC_PROF) fprintf(stderr, "LP\tn_iter=%ld\tmmax_f=%d\trmq_size=%d\tmp_max=%ld\n", (long)n_iter, mmax_f, max_rmq_size, mp->max);
 	km_destroy(mem_mp);
+	if (mem_mpi) km_destroy(mem_mpi);
 
 	u = mg_chain_backtrack(km, n, f, p, v, t, min_cnt, min_sc, max_drop, 0, &n_u, &n_v);
 	*n_u_ = n_u, *_u = u; // NB: note that u[] may not be sorted by score here
