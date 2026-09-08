@@ -9,6 +9,8 @@
 struct mg_tbuf_s {
 	void *km;
 	int frag_gap;
+	int n_threads;             // thread budget of the enclosing kt_for(), for intra-sequence parallelism
+	volatile int64_t *rem_len; // total length of the query sequences not finished yet; shared by all buffers
 };
 
 mg_tbuf_t *mg_tbuf_init(void)
@@ -29,6 +31,31 @@ void mg_tbuf_destroy(mg_tbuf_t *b)
 void *mg_tbuf_get_km(mg_tbuf_t *b)
 {
 	return b->km;
+}
+
+void mg_tbuf_set_par(mg_tbuf_t *b, int n_threads, volatile int64_t *rem_len)
+{
+	b->n_threads = n_threads, b->rem_len = rem_len;
+}
+
+#define MG_LC_PAR_MIN_A 50000 // don't thread the chaining of a query with fewer anchors than this
+
+// Number of threads to give to the chaining of one query sequence. kt_for() has one task per
+// query sequence, so with few and very unequal sequences - 1-5 per file for per-chromosome
+// minigraph-cactus jobs - most threads sit idle. Give this sequence its share of the thread
+// budget by length, out of the sequences that have not finished yet; when it is the only one
+// left (or dominates the remaining work) it gets the whole budget.
+static int mg_lc_threads(const mg_tbuf_t *b, const mg_mapopt_t *opt, int64_t qlen, int64_t n_a)
+{
+	int64_t rem, n;
+	if (opt->lc_threads > 0) return opt->lc_threads; // explicitly set with --lc-threads
+	if (b->n_threads <= 1 || b->rem_len == 0 || qlen <= 0 || n_a < MG_LC_PAR_MIN_A) return 1;
+	rem = *b->rem_len;
+	if (rem <= qlen) return b->n_threads;
+	n = ((int64_t)b->n_threads * qlen + rem - 1) / rem; // ceil of the fair share
+	if (n < 1) n = 1;
+	if (n > b->n_threads) n = b->n_threads;
+	return (int)n;
 }
 
 static void collect_minimizers(void *km, const mg_mapopt_t *opt, const mg_idx_t *gi, int n_segs, const int *qlens, const char **seqs, mg128_v *mv)
@@ -396,7 +423,7 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	} else {
 		if (opt->flag & MG_M_RMQ) {
 			a = mg_lchain_rmq(opt->max_gap, opt->max_gap_pre, opt->bw, opt->max_lc_skip, opt->rmq_size_cap, opt->min_lc_cnt, opt->min_lc_score,
-							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km);
+							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km, mg_lc_threads(b, opt, qlen_sum, n_a));
 		} else {
 			a = mg_lchain_dp(max_chain_gap_ref, max_chain_gap_qry, opt->bw, opt->max_lc_skip, opt->max_lc_iter, opt->min_lc_cnt, opt->min_lc_score,
 							 chn_pen_gap, chn_pen_skip, is_splice, n_segs, n_a, a, &n_lc, &u, b->km);
@@ -412,7 +439,7 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 			kfree(b->km, u);
 			radix_sort_128x(a, a + n_a);
 			a = mg_lchain_rmq(opt->max_gap, opt->max_gap_pre, opt->bw_long, opt->max_lc_skip, opt->rmq_size_cap, opt->min_lc_cnt, opt->min_lc_score,
-							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km);
+							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km, mg_lc_threads(b, opt, qlen_sum, n_a));
 		}
 	}
 

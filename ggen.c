@@ -23,6 +23,7 @@ typedef struct {
 	mg_tbuf_t **buf;
 	maprst_t *r;
 	uint64_t *ord; // sequence indices sorted by length in the descending order
+	volatile int64_t rem_len; // total length of the sequences not mapped yet; for intra-sequence parallel chaining
 } step_t;
 
 static void worker_for(void *_data, long i, int tid) // kt_for() callback
@@ -37,6 +38,7 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 					__func__, s->r->seq[i].name);
 	}
 	s->r->gcs[i] = mg_map(s->gi, s->r->seq[i].l_seq, s->r->seq[i].seq, s->buf[tid], s->opt, s->r->seq[i].name);
+	__sync_fetch_and_sub(&s->rem_len, (int64_t)s->r->seq[i].l_seq);
 }
 
 static maprst_t *ggen_load(const char *fn)
@@ -81,11 +83,16 @@ static void ggen_map(const mg_idx_t *gi, const mg_mapopt_t *opt, maprst_t *r, in
 
 	s.gi = gi, s.opt = opt, s.r = r;
 	KMALLOC(0, s.ord, r->n_seq);
-	for (i = 0; i < r->n_seq; ++i) // map long sequences first for better load balancing
+	for (i = 0, s.rem_len = 0; i < r->n_seq; ++i) { // map long sequences first for better load balancing
 		s.ord[i] = (uint64_t)(INT32_MAX - r->seq[i].l_seq) << 32 | i;
+		s.rem_len += r->seq[i].l_seq;
+	}
 	radix_sort_gfa64(s.ord, s.ord + r->n_seq);
 	KCALLOC(0, s.buf, n_threads);
-	for (i = 0; i < n_threads; ++i) s.buf[i] = mg_tbuf_init();
+	for (i = 0; i < n_threads; ++i) {
+		s.buf[i] = mg_tbuf_init();
+		mg_tbuf_set_par(s.buf[i], n_threads, &s.rem_len);
+	}
 	kt_for(n_threads, worker_for, &s, r->n_seq);
 	free(s.ord);
 	if (mg_verbose >= 3)

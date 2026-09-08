@@ -49,6 +49,7 @@ static ko_longopt_t long_options[] = {
 	{ "call",         ko_no_argument,       327 },
 	{ "cap-calloc",   ko_required_argument, 328 },
 	{ "gdp-max-ed",   ko_required_argument, 329 },
+	{ "lc-threads",   ko_required_argument, 331 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -166,6 +167,7 @@ int main(int argc, char *argv[])
 		else if (c == 327) gpt.flag |= MG_G_CALL, opt.flag |= MG_M_SKIP_GCHECK; // --call
 		else if (c == 328) opt.cap_kalloc = mm_parse_num(o.arg); // --cap-kalloc
 		else if (c == 329) opt.gdp_max_ed = mm_parse_num(o.arg); // --gdp-max-ed
+		else if (c == 331) opt.lc_threads = atoi(o.arg);      // --lc-threads
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -235,6 +237,8 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    -c           perform base alignment; RECOMMENDED\n");
 		fprintf(fp_help, "    -f FLOAT     ignore top FLOAT fraction of repetitive minimizers [%g]\n", opt.occ_max1_frac);
 		fprintf(fp_help, "    -U INT[,INT] choose the minimizer occurrence threshold within this interval [%d,%d]\n", opt.occ_max1, opt.occ_max1_cap);
+		fprintf(fp_help, "    --lc-threads INT\n");
+		fprintf(fp_help, "                 threads for chaining one query sequence; 0 for auto [%d]\n", opt.lc_threads);
 		fprintf(fp_help, "    -j FLOAT     expected sequence divergence [%g]\n", opt.div);
 		fprintf(fp_help, "    -g NUM       stop chain enlongation if there are no minimizers in INT-bp [%d]\n", opt.max_gap);
 		fprintf(fp_help, "    -F NUM       max fragment length (effective with -xsr or in the fragment mode) [%d]\n", opt.max_frag_len);

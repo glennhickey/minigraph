@@ -5,6 +5,7 @@
 #include "mgpriv.h"
 #include "kalloc.h"
 #include "krmq.h"
+#include "kthread.h"
 #include "kavl.h"
 
 static int64_t mg_chain_bk_end(int32_t max_drop, const mg128_t *z, const int32_t *f, const int64_t *p, int32_t *t, int64_t k)
@@ -260,38 +261,70 @@ static inline int32_t comput_sc_simple(const mg128_t *ai, const mg128_t *aj, flo
 	return sc;
 }
 
-mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_skip, int cap_rmq_size, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
-					   int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km)
+/*****************************************************************************
+ * RMQ linear chaining, parallelized over (segment,strand) anchor groups
+ *
+ * The fill loop below is the original serial loop of mg_lchain_rmq(), moved
+ * into lc_rmq_fill() so that it can be applied to a sub-range of a[].
+ *
+ * Independence argument (see also the comment on mg_lchain_rmq()): a[] is
+ * processed as a sequence of maximal runs ("groups") of equal a[].x>>32
+ * (= segment<<1 | strand).  At the first anchor i of a run, every anchor
+ * j < i has a different a[].x>>32, so the two eviction loops advance st and
+ * st_inner all the way to i and erase every node from both trees; the "add
+ * in-range anchors" block above them has already set i0 = i (a[i0].x != a[i].x
+ * always holds across a run boundary), and the nodes it inserted for the
+ * previous run are erased by those same eviction loops before any query is
+ * made.  So at a run boundary the state carried by the loop is exactly
+ * (root = 0, root_inner = 0, st = st_inner = i0 = i) - which is what
+ * lc_rmq_fill() starts from - and n_iter/mmax_f/max_rmq_size are pure
+ * bookkeeping.  Within a run, f/p/v/t are read and written only at indices
+ * of that run (all j come from the trees, and p[] never points out of the
+ * run), and a[] is not modified.  Therefore the runs can be processed in any
+ * order, on any thread, and the resulting f/p/v/t are bit-identical to the
+ * serial loop.  mg_chain_backtrack() then runs globally as before.
+ *****************************************************************************/
+
+typedef struct { // per-thread scratch; padded to a cache line, as threads write to adjacent entries
+	void *km;      // private arena backing the two node pools
+	kmp_rmq_t *mp;
+	kmp_lcin_t *mpi;
+	int64_t n_iter;
+	int64_t mp_max;
+	int32_t mmax_f, max_rmq_size;
+	int64_t pad[2];
+} lc_buf_t;
+
+typedef struct {
+	const mg128_t *a;
+	int64_t n;
+	int32_t *f, *t, *v;
+	int64_t *p;
+	int32_t max_dist, max_dist_inner, bw, max_chn_skip, cap_rmq_size;
+	float chn_pen_gap, chn_pen_skip;
+	const int64_t *bnd;  // group g spans anchors [bnd[g], bnd[g+1])
+	const uint64_t *ord; // group ids as size<<32|id, largest group first
+	lc_buf_t *buf;
+} lc_par_t;
+
+// fill f[]/p[]/v[] for anchors [st_g, en_g); the range must start at a group boundary and end at one
+static void lc_rmq_fill(const lc_par_t *ap, int64_t st_g, int64_t en_g, lc_buf_t *w, int flush)
 {
-	int32_t *f,*t, *v, n_u, n_v, mmax_f = 0, max_rmq_size = 0, max_drop = bw;
-	int64_t *p, i, i0, st = 0, st_inner = 0, n_iter = 0;
-	uint64_t *u;
+	const mg128_t *a = ap->a;
+	const int64_t n = ap->n;
+	int32_t *f = ap->f, *t = ap->t, *v = ap->v;
+	int64_t *p = ap->p;
+	const int32_t max_dist = ap->max_dist, max_dist_inner = ap->max_dist_inner, bw = ap->bw;
+	const int32_t max_chn_skip = ap->max_chn_skip, cap_rmq_size = ap->cap_rmq_size;
+	const float chn_pen_gap = ap->chn_pen_gap, chn_pen_skip = ap->chn_pen_skip;
+	kmp_rmq_t *mp = w->mp;
+	kmp_lcin_t *mpi = w->mpi;
 	lc_elem_t *root = 0;
 	lc_inode_t *root_inner = 0;
-	void *mem_mp = 0, *mem_mpi = 0;
-	kmp_rmq_t *mp;
-	kmp_lcin_t *mpi = 0;
+	int64_t i, i0, st = st_g, st_inner = st_g, n_iter = 0; // accumulate the stats in locals: w is shared between threads
+	int32_t mmax_f = 0, max_rmq_size = 0;
 
-	if (_u) *_u = 0, *n_u_ = 0;
-	if (n == 0 || a == 0) {
-		kfree(km, a);
-		return 0;
-	}
-	if (max_dist < bw) max_dist = bw;
-	if (max_dist_inner <= 0 || max_dist_inner >= max_dist) max_dist_inner = 0;
-	KMALLOC(km, p, n);
-	KMALLOC(km, f, n);
-	KCALLOC(km, t, n);
-	KMALLOC(km, v, n);
-	mem_mp = km_init2(km, 0x10000);
-	mp = kmp_init_rmq(mem_mp);
-	if (max_dist_inner > 0) {
-		mem_mpi = km_init2(km, 0x10000);
-		mpi = kmp_init_lcin(mem_mpi);
-	}
-
-	// fill the score and backtrack arrays
-	for (i = i0 = 0; i < n; ++i) {
+	for (i = i0 = st_g; i < en_g; ++i) {
 		int64_t max_j = -1;
 		int32_t q_span = a[i].y>>32&0xff, max_f = q_span;
 		lc_elem_t s, *q, lo, hi;
@@ -371,11 +404,157 @@ mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 		f[i] = max_f, p[i] = max_j;
 		v[i] = max_j >= 0 && v[max_j] > max_f? v[max_j] : max_f; // v[] keeps the peak score up to i; f[] is the score ending at i, not always the peak
 		if (mmax_f < max_f) mmax_f = max_f;
-		if (max_rmq_size < krmq_size(head, root)) max_rmq_size = krmq_size(head, root);
+		if (max_rmq_size < (int32_t)krmq_size(head, root)) max_rmq_size = krmq_size(head, root);
 	}
-	if (mg_dbg_flag & MG_DBG_LC_PROF) fprintf(stderr, "LP\tn_iter=%ld\tmmax_f=%d\trmq_size=%d\tmp_max=%ld\n", (long)n_iter, mmax_f, max_rmq_size, mp->max);
-	km_destroy(mem_mp);
-	if (mem_mpi) km_destroy(mem_mpi);
+	w->n_iter += n_iter;
+	if (w->mmax_f < mmax_f) w->mmax_f = mmax_f;
+	if (w->max_rmq_size < max_rmq_size) w->max_rmq_size = max_rmq_size;
+	if (flush) { // give the nodes left in the trees back to the pools, for the next group on this thread
+		if (root) {
+			krmq_itr_t(lc_elem) itr;
+			const lc_elem_t *q;
+			krmq_itr_first(lc_elem, root, &itr);
+			while ((q = krmq_at(&itr)) != 0) { // kmp_free_*() only pushes the pointer, it doesn't touch the node
+				kmp_free_rmq(mp, (lc_elem_t*)q);
+				if (!krmq_itr_next(lc_elem, &itr)) break;
+			}
+		}
+		if (root_inner) {
+			kavl_itr_t(lc_in) itr;
+			const lc_inode_t *q;
+			kavl_itr_first(lc_in, root_inner, &itr);
+			while ((q = kavl_at(&itr)) != 0) {
+				kmp_free_lcin(mpi, (lc_inode_t*)q);
+				if (!kavl_itr_next(lc_in, &itr)) break;
+			}
+		}
+	}
+}
+
+static void lc_worker(void *data, long k, int tid) // kt_for() callback: one group per call
+{
+	lc_par_t *ap = (lc_par_t*)data;
+	lc_buf_t *w = &ap->buf[tid];
+	int64_t g = (int64_t)(uint32_t)ap->ord[k];
+	if (w->km == 0) { // NB: km_init2(0,...) is backed by malloc, so this doesn't touch the shared kalloc arena
+		w->km = km_init2(0, 0x10000);
+		w->mp = kmp_init_rmq(w->km);
+		if (ap->max_dist_inner > 0) w->mpi = kmp_init_lcin(w->km);
+	}
+	lc_rmq_fill(ap, ap->bnd[g], ap->bnd[g + 1], w, 1);
+}
+
+static void lc_buf_reduce(lc_buf_t *dst, const lc_buf_t *src)
+{
+	dst->n_iter += src->n_iter;
+	if (dst->mmax_f < src->mmax_f) dst->mmax_f = src->mmax_f;
+	if (dst->max_rmq_size < src->max_rmq_size) dst->max_rmq_size = src->max_rmq_size;
+	if (dst->mp_max < src->mp_max) dst->mp_max = src->mp_max;
+}
+
+/* Input:
+ *   a[].x: tid<<33 | rev<<32 | tpos  (sorted)
+ *   a[].y: flags<<40 | q_span<<32 | q_pos
+ * The DP is independent within each maximal run of equal a[].x>>32; with
+ * n_threads > 1 the runs are chained in parallel (largest first).  The result
+ * does not depend on n_threads.
+ */
+mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_skip, int cap_rmq_size, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
+					   int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km, int n_threads)
+{
+	int32_t *f, *t, *v, n_u, n_v, max_drop = bw;
+	int64_t *p, n_grp = 0;
+	int64_t *bnd = 0;
+	uint64_t *u, *ord = 0;
+	lc_par_t ap;
+	lc_buf_t red;
+	int par, nt_used = 1;
+
+	if (_u) *_u = 0, *n_u_ = 0;
+	if (n == 0 || a == 0) {
+		kfree(km, a);
+		return 0;
+	}
+	if (max_dist < bw) max_dist = bw;
+	if (max_dist_inner <= 0 || max_dist_inner >= max_dist) max_dist_inner = 0;
+	KMALLOC(km, p, n);
+	KMALLOC(km, f, n);
+	KCALLOC(km, t, n);
+	KMALLOC(km, v, n);
+
+	memset(&ap, 0, sizeof(lc_par_t));
+	memset(&red, 0, sizeof(lc_buf_t));
+	ap.a = a, ap.n = n, ap.f = f, ap.t = t, ap.v = v, ap.p = p;
+	ap.max_dist = max_dist, ap.max_dist_inner = max_dist_inner, ap.bw = bw;
+	ap.max_chn_skip = max_chn_skip, ap.cap_rmq_size = cap_rmq_size;
+	ap.chn_pen_gap = chn_pen_gap, ap.chn_pen_skip = chn_pen_skip;
+
+	par = (n_threads > 1); // the caller decides whether the query is worth threading; see mg_lc_threads()
+	if (par || (mg_dbg_flag & MG_DBG_LC_PROF)) { // find the group boundaries in one pass
+		int64_t i, m_grp = 0;
+		for (i = 0; i < n; ++i)
+			if (i == 0 || a[i].x>>32 != a[i-1].x>>32) {
+				if (n_grp + 1 >= m_grp) KEXPAND(km, bnd, m_grp);
+				bnd[n_grp++] = i;
+			}
+		bnd[n_grp] = n;
+	}
+
+	if (par && n_grp > 1) { // chain the groups in parallel
+		int64_t i;
+		int j, nt = n_threads < n_grp? n_threads : (int)n_grp;
+		KMALLOC(km, ord, n_grp);
+		for (i = 0; i < n_grp; ++i)
+			ord[i] = (uint64_t)(bnd[i+1] - bnd[i]) << 32 | (uint64_t)i;
+		radix_sort_gfa64(ord, ord + n_grp);
+		for (i = 0; i < n_grp>>1; ++i) { // largest group first, for load balance
+			uint64_t tmp = ord[i];
+			ord[i] = ord[n_grp - 1 - i], ord[n_grp - 1 - i] = tmp;
+		}
+		KCALLOC(km, ap.buf, nt);
+		ap.bnd = bnd, ap.ord = ord;
+		nt_used = nt;
+		kt_for(nt, lc_worker, &ap, n_grp);
+		for (j = 0; j < nt; ++j) {
+			if (ap.buf[j].km == 0) continue;
+			ap.buf[j].mp_max = ap.buf[j].mp->max;
+			lc_buf_reduce(&red, &ap.buf[j]);
+			km_destroy(ap.buf[j].km); // frees both pools
+		}
+		kfree(km, ap.buf);
+	} else { // serial: the whole array is one range, which is exactly the original loop
+		red.km = km_init2(km, 0x10000);
+		red.mp = kmp_init_rmq(red.km);
+		if (max_dist_inner > 0) red.mpi = kmp_init_lcin(red.km);
+		lc_rmq_fill(&ap, 0, n, &red, 0);
+		red.mp_max = red.mp->max;
+		km_destroy(red.km);
+	}
+	if (mg_dbg_flag & MG_DBG_LC_PROF) {
+		int64_t i;
+		uint64_t h = 0x1234567890abcdefULL;
+		for (i = 0; i < n; ++i) // checksum of the DP result; must not depend on n_threads
+			h = (h ^ ((uint64_t)(uint32_t)f[i] << 32 | (uint32_t)v[i])) * 0x100000001b3ULL, h ^= (uint64_t)(p[i] + 1) + (h >> 29);
+		fprintf(stderr, "LP\tn_iter=%ld\tmmax_f=%d\trmq_size=%d\tmp_max=%ld\tn_grp=%ld\tnt=%d\tfpv=%016lx\n", (long)red.n_iter, red.mmax_f, red.max_rmq_size,
+				(long)red.mp_max, (long)n_grp, nt_used, (unsigned long)h);
+		if (n_grp > 0) { // group-size distribution and the speedup it allows, plus the 8 largest groups
+			int64_t i, j, top[8], n_top = n_grp < 8? n_grp : 8;
+			double sum_mlogm = 0.0;
+			for (j = 0; j < 8; ++j) top[j] = 0;
+			for (i = 0; i < n_grp; ++i) { // partial selection sort of the 8 largest
+				int64_t sz = bnd[i+1] - bnd[i];
+				sum_mlogm += (double)sz * mg_log2(sz + 1.0);
+				for (j = 0; j < n_top; ++j)
+					if (sz > top[j]) { int64_t tmp = top[j]; top[j] = sz, sz = tmp; }
+			}
+			// the largest group is one task, so the speedup is at most (total work)/(work of the largest group)
+			fprintf(stderr, "LG\tn=%ld\tn_grp=%ld\tbound_lin=%.2f\tbound_mlogm=%.2f", (long)n, (long)n_grp,
+					(double)n / top[0], sum_mlogm / ((double)top[0] * mg_log2(top[0] + 1.0)));
+			for (j = 0; j < n_top; ++j) fprintf(stderr, "\t%ld", (long)top[j]);
+			fprintf(stderr, "\n");
+		}
+	}
+	kfree(km, ord); kfree(km, bnd);
 
 	u = mg_chain_backtrack(km, n, f, p, v, t, min_cnt, min_sc, max_drop, 0, &n_u, &n_v);
 	*n_u_ = n_u, *_u = u; // NB: note that u[] may not be sorted by score here

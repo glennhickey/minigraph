@@ -75,6 +75,7 @@ typedef struct {
 	int ref_bonus;
 	int64_t cap_kalloc;
 	int min_cov_mapq, min_cov_blen;
+	int lc_threads; // 0 for auto: # threads for chaining one query sequence
 } mg_mapopt_t;
 
 typedef struct {
@@ -170,6 +171,7 @@ mg_tbuf_t *mg_tbuf_init(void);
 void mg_tbuf_destroy(mg_tbuf_t *b);
 mg_gchains_t *mg_map(const mg_idx_t *gi, int qlen, const char *seq, mg_tbuf_t *b, const mg_mapopt_t *opt, const char *qname);
 void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **seqs, mg_gchains_t **gcs, mg_tbuf_t *b, const mg_mapopt_t *opt, const char *qname);
+void mg_tbuf_set_par(mg_tbuf_t *b, int n_threads, volatile int64_t *rem_len); // enable intra-sequence parallel chaining
 
 // high-level mapping APIs
 int mg_map_files(gfa_t *g, int n_fn, const char **fn, const mg_idxopt_t *ipt, const mg_mapopt_t *opt0, int n_threads);

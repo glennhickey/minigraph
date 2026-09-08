@@ -86,7 +86,7 @@ uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f, const int64_
 mg128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int max_iter, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
 					  int is_cdna, int n_seg, int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km);
 mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_skip, int cap_rmq_size, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
-					   int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km);
+					   int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km, int n_threads);
 mg_lchain_t *mg_lchain_gen(void *km, uint32_t hash, int qlen, int n_u, uint64_t *u, mg128_t *a);
 void mg_update_anchors(int32_t n_a, mg128_t *a, int32_t n, const int32_t *mini_pos);
 

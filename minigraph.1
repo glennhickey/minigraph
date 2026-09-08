@@ -68,6 +68,15 @@ it will be the final threshold; otherwise the lower or the upper bound of
 .B -U
 will be applied.
 .TP
+.BI --lc-threads \ INT
+Number of threads used to chain the anchors of one query sequence [0]. Linear
+chaining is independent for each (segment,strand) group of anchors, so it can
+be parallelized within a single query. 0 selects the number automatically:
+each query sequence gets its share, by length, of
+.B -t
+out of the query sequences that have not been mapped yet. The result does not
+depend on this option.
+.TP
 .BI -j \ FLOAT
 Expected query-graph sequence divergence [0.1]
 .TP

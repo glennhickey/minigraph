@@ -16,6 +16,7 @@ void mg_mapopt_init(mg_mapopt_t *mo)
 	mo->seed = 11;
 	mo->occ_max1 = 50, mo->occ_max1_cap = 250;
 	mo->occ_max1_frac = 2e-4f;
+	mo->lc_threads = 0;
 	mo->max_gap = 5000;
 	mo->max_gap_ref = -1;
 	mo->max_gap_pre = 1000;
