@@ -87,6 +87,7 @@ typedef struct {
 typedef struct {
 	// segments
 	uint32_t m_seg, n_seg, max_rank;
+	uint32_t is_upper; // all segment sequences are uppercase
 	gfa_seg_t *seg;
 	void *h_names;
 	// persistent names
@@ -125,7 +126,7 @@ void gfa_destroy(gfa_t *g);
 gfa_t *gfa_read(const char *fn);
 void gfa_print(const gfa_t *g, FILE *fp, int M_only);
 
-gfa_edseq_t *gfa_edseq_init(const gfa_t *g);
+gfa_edseq_t *gfa_edseq_init(const gfa_t *g, int n_threads);
 void gfa_edseq_destroy(int32_t n_seg, gfa_edseq_t *es);
 
 int32_t gfa_name2id(const gfa_t *g, const char *name);

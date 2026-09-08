@@ -1,3 +1,4 @@
+#include <string.h>
 #include <assert.h>
 #include "mgpriv.h"
 #include "khashl.h"
@@ -40,6 +41,7 @@ void mg_idx_destroy(mg_idx_t *gi)
 		free(gi->B);
 	}
 	gfa_edseq_destroy(gi->n_seg, gi->es);
+	free(gi->occ.a);
 	free(gi);
 }
 
@@ -73,37 +75,20 @@ const uint64_t *mg_idx_get(const mg_idx_t *gi, uint64_t minier, int *n)
 
 void mg_idx_cal_quantile(const mg_idx_t *gi, int32_t m, float f[], int32_t q[])
 {
-	int32_t i;
-	uint64_t n = 0;
-	khint_t *a, k;
-	for (i = 0; i < 1<<gi->b; ++i)
-		if (gi->B[i].h) n += kh_size((idxhash_t*)gi->B[i].h);
-	a = (uint32_t*)malloc(n * 4);
-	for (i = 0, n = 0; i < 1<<gi->b; ++i) {
-		idxhash_t *h = (idxhash_t*)gi->B[i].h;
-		if (h == 0) continue;
-		for (k = 0; k < kh_end(h); ++k) {
-			if (!kh_exist(h, k)) continue;
-			a[n++] = kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
-		}
+	int32_t i, c;
+	uint64_t n = 0, s;
+	for (c = 0; c < gi->occ.n; ++c) n += gi->occ.a[c];
+	for (i = 0; i < m; ++i) { // q[i] is the (1-f[i])*n-th smallest occurrence (0-based)
+		uint64_t k = (uint64_t)((1.0 - (double)f[i]) * n);
+		for (c = 0, s = 0; c + 1 < gi->occ.n; ++c)
+			if ((s += gi->occ.a[c]) > k) break;
+		q[i] = c;
 	}
-	for (i = 0; i < m; ++i)
-		q[i] = ks_ksmall_uint32_t(n, a, (size_t)((1.0 - (double)f[i]) * n));
-	free(a);
 }
 
 /***************
  * Index build *
  ***************/
-
-static void mg_idx_add(mg_idx_t *gi, int n, const mg128_t *a)
-{
-	int i, mask = (1<<gi->b) - 1;
-	for (i = 0; i < n; ++i) {
-		mg128_v *p = &gi->B[a[i].x>>8&mask].a;
-		kv_push(mg128_t, 0, *p, a[i]);
-	}
-}
 
 void mg_idx_hfree(void *h_)
 {
@@ -164,12 +149,67 @@ void *mg_idx_a2h(void *km, int32_t n_a, mg128_t *a, int suflen, uint64_t **q_, i
 	return h;
 }
 
-static void worker_post(void *g, long i, int tid)
+typedef struct {
+	mg_idx_t *gi;
+	int n_threads;
+	mg128_v *buf; // n_threads scratch arrays for mg_sketch()
+	mg128_v *tb;  // n_threads<<b arrays; thread t appends to tb[t<<b|bucket]
+	mg64_v *occ;  // n_threads occurrence histograms
+} idx_step_t;
+
+static void worker_sketch(void *data, long i, int tid)
 {
-	mg_idx_t *gi = (mg_idx_t*)g;
-	mg_idx_bucket_t *b = &gi->B[i];
-	if (b->a.n == 0) return;
-	b->h = (idxhash_t*)mg_idx_a2h(0, b->a.n, b->a.a, gi->b, &b->p, &b->n);
+	idx_step_t *s = (idx_step_t*)data;
+	const gfa_seg_t *seg = &s->gi->g->seg[i];
+	mg128_v *a = &s->buf[tid], *tb = &s->tb[(size_t)tid << s->gi->b];
+	int mask = (1<<s->gi->b) - 1;
+	size_t j;
+	a->n = 0;
+	mg_sketch(0, seg->seq, seg->len, s->gi->w, s->gi->k, i, a);
+	for (j = 0; j < a->n; ++j) {
+		mg128_v *p = &tb[a->a[j].x>>8&mask];
+		kv_push(mg128_t, 0, *p, a->a[j]);
+	}
+}
+
+static void worker_post(void *data, long i, int tid)
+{
+	idx_step_t *s = (idx_step_t*)data;
+	mg_idx_bucket_t *b = &s->gi->B[i];
+	mg64_v *occ = &s->occ[tid];
+	size_t j, n, tot = 0;
+	int t;
+	for (t = 0; t < s->n_threads; ++t) // gather the pieces of bucket i from all threads
+		tot += s->tb[(size_t)t << s->gi->b | i].n;
+	if (tot == 0) return;
+	if (s->n_threads == 1) {
+		b->a = s->tb[i], s->tb[i].a = 0;
+	} else {
+		KMALLOC(0, b->a.a, tot);
+		for (t = 0, b->a.n = 0; t < s->n_threads; ++t) {
+			mg128_v *p = &s->tb[(size_t)t << s->gi->b | i];
+			if (p->n > 0) memcpy(&b->a.a[b->a.n], p->a, p->n * sizeof(mg128_t));
+			b->a.n += p->n;
+			kfree(0, p->a);
+			p->a = 0;
+		}
+	}
+	b->h = (idxhash_t*)mg_idx_a2h(0, b->a.n, b->a.a, s->gi->b, &b->p, &b->n);
+	for (j = 1, n = 1; j <= b->a.n; ++j) { // b->a is sorted by minimizer now; count occurrences
+		if (j < b->a.n && b->a.a[j].x>>8 == b->a.a[j-1].x>>8) {
+			++n;
+			continue;
+		}
+		if (n >= occ->n) {
+			int32_t m = occ->n;
+			occ->n = n + 1;
+			kroundup32(occ->n);
+			KREALLOC(0, occ->a, occ->n);
+			memset(&occ->a[m], 0, (occ->n - m) * sizeof(uint64_t));
+		}
+		++occ->a[n];
+		n = 1;
+	}
 	kfree(0, b->a.a);
 	b->a.n = b->a.m = 0, b->a.a = 0;
 }
@@ -186,8 +226,8 @@ int mg_gfa_overlap(const gfa_t *g)
 mg_idx_t *mg_index_core(gfa_t *g, int k, int w, int b, int n_threads)
 {
 	mg_idx_t *gi;
-	mg128_v a = {0,0,0};
-	int i;
+	idx_step_t s;
+	int i, j;
 
 	if (mg_gfa_overlap(g)) {
 		if (mg_verbose >= 1)
@@ -197,30 +237,46 @@ mg_idx_t *mg_index_core(gfa_t *g, int k, int w, int b, int n_threads)
 	gi = mg_idx_init(k, w, b);
 	gi->g = g;
 
-	for (i = 0; i < g->n_seg; ++i) {
-		gfa_seg_t *s = &g->seg[i];
-		a.n = 0;
-		mg_sketch(0, s->seq, s->len, w, k, i, &a); // TODO: this can be parallelized
-		mg_idx_add(gi, a.n, a.a);
+	if (n_threads < 1) n_threads = 1;
+	s.gi = gi, s.n_threads = n_threads;
+	KCALLOC(0, s.buf, n_threads);
+	KCALLOC(0, s.tb, (size_t)n_threads << gi->b);
+	KCALLOC(0, s.occ, n_threads);
+	kt_for(n_threads, worker_sketch, &s, g->n_seg);
+	for (i = 0; i < n_threads; ++i) free(s.buf[i].a);
+	free(s.buf);
+	kt_for(n_threads, worker_post, &s, 1<<gi->b);
+	free(s.tb);
+	for (i = 0; i < n_threads; ++i) // merge the per-thread histograms
+		if (gi->occ.n < s.occ[i].n) gi->occ.n = s.occ[i].n;
+	KCALLOC(0, gi->occ.a, gi->occ.n);
+	for (i = 0; i < n_threads; ++i) {
+		for (j = 0; j < s.occ[i].n; ++j) gi->occ.a[j] += s.occ[i].a[j];
+		free(s.occ[i].a);
 	}
-	free(a.a);
-	kt_for(n_threads, worker_post, gi, 1<<gi->b);
+	free(s.occ);
 	return gi;
+}
+
+static void worker_upper(void *data, long i, int tid)
+{
+	gfa_seg_t *s = &((gfa_t*)data)->seg[i];
+	int32_t j;
+	for (j = 0; j < s->len; ++j)
+		if (s->seq[j] >= 'a' && s->seq[j] <= 'z')
+			s->seq[j] -= 32;
 }
 
 mg_idx_t *mg_index(gfa_t *g, const mg_idxopt_t *io, int n_threads, mg_mapopt_t *mo)
 {
-	int32_t i, j;
 	mg_idx_t *gi;
-	for (i = 0; i < g->n_seg; ++i) { // uppercase
-		gfa_seg_t *s = &g->seg[i];
-		for (j = 0; j < s->len; ++j)
-			if (s->seq[j] >= 'a' && s->seq[j] <= 'z')
-				s->seq[j] -= 32;
+	if (!g->is_upper) { // gfa_augment() only adds uppercase sequences, so this is needed once
+		kt_for(n_threads, worker_upper, g, g->n_seg);
+		g->is_upper = 1;
 	}
 	gi = mg_index_core(g, io->k, io->w, io->bucket_bits, n_threads);
 	if (gi == 0) return 0;
-	gi->es = gfa_edseq_init(gi->g);
+	gi->es = gfa_edseq_init(gi->g, n_threads);
 	gi->n_seg = g->n_seg;
 	if (mg_verbose >= 3)
 		fprintf(stderr, "[M::%s::%.3f*%.2f] indexed the graph\n", __func__,

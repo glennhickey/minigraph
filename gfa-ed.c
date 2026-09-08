@@ -7,6 +7,7 @@
 #include "khashl.h" // make it compatible with kalloc
 #include "kdq.h"
 #include "kvec-km.h"
+#include "kthread.h"
 
 int gfa_ed_dbg = 0;
 
@@ -21,24 +22,34 @@ void gfa_edopt_init(gfa_edopt_t *opt)
 	opt->max_chk = 1000;
 }
 
-gfa_edseq_t *gfa_edseq_init(const gfa_t *g)
-{
-	uint32_t i, n_vtx = gfa_n_vtx(g);
+typedef struct {
+	const gfa_t *g;
 	gfa_edseq_t *es;
-	GFA_MALLOC(es, n_vtx);
-	for (i = 0; i < g->n_seg; ++i) {
-		const gfa_seg_t *s = &g->seg[i];
-		char *t;
-		int32_t j;
-		GFA_MALLOC(t, s->len + 1);
-		for (j = 0; j < s->len; ++j)
-			t[s->len - j - 1] = gfa_comp_table[(uint8_t)s->seq[j]];
-		t[s->len] = 0;
-		es[i<<1].seq = (char*)s->seq;
-		es[i<<1|1].seq = t;
-		es[i<<1].len = es[i<<1|1].len = s->len;
-	}
-	return es;
+} edseq_aux_t;
+
+static void worker_edseq(void *data, long i, int tid)
+{
+	edseq_aux_t *d = (edseq_aux_t*)data;
+	const gfa_seg_t *s = &d->g->seg[i];
+	gfa_edseq_t *es = d->es;
+	char *t;
+	int32_t j;
+	GFA_MALLOC(t, s->len + 1);
+	for (j = 0; j < s->len; ++j)
+		t[s->len - j - 1] = gfa_comp_table[(uint8_t)s->seq[j]];
+	t[s->len] = 0;
+	es[i<<1].seq = (char*)s->seq;
+	es[i<<1|1].seq = t;
+	es[i<<1].len = es[i<<1|1].len = s->len;
+}
+
+gfa_edseq_t *gfa_edseq_init(const gfa_t *g, int n_threads)
+{
+	edseq_aux_t d;
+	d.g = g;
+	GFA_MALLOC(d.es, gfa_n_vtx(g));
+	kt_for(n_threads, worker_edseq, &d, g->n_seg);
+	return d.es;
 }
 
 void gfa_edseq_destroy(int32_t n_seg, gfa_edseq_t *es)

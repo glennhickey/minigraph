@@ -29,6 +29,7 @@
 #define MG_M_WRITE_MZ     0x1000000
 #define MG_M_SKIP_GCHECK  0x2000000
 #define MG_M_CIGAR        0x4000000
+#define MG_M_NO_DS        0x8000000
 
 #define MG_G_NONE         0
 #define MG_G_GGSIMPLE     1
@@ -94,6 +95,7 @@ typedef struct {
 	const gfa_t *g;
 	gfa_edseq_t *es;
 	int32_t b, w, k, flag, n_seg;
+	mg64_v occ; // occ.a[c] is the number of distinct minimizers occurring c times
 	struct mg_idx_bucket_s *B; // index (hidden)
 } mg_idx_t;
 
