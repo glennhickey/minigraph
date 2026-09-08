@@ -15,6 +15,7 @@ void mwf_opt_init(mwf_opt_t *opt)
 	opt->o1 = 4, opt->e1 = 2;
 	opt->o2 = 15, opt->e2 = 1;
 	opt->kmer = 13, opt->max_occ = 2, opt->min_len = 30;
+	opt->sub_iter = 300000000;
 }
 
 /*
@@ -240,6 +241,21 @@ static inline int32_t wf_extend1_padded(const char *ts, const char *qs, int32_t 
 
 #define wf_max(a, b) ((a) >= (b)? (a) : (b))
 
+// On x86-64, the vectorized loops below are compiled for the default target and for AVX2; the twin is chosen at run time.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define WF_AVX2_TWIN
+#define WF_KERNEL static inline __attribute__((always_inline))
+static int wf_has_avx2 = -1; // set once; the race between threads is benign
+
+static inline int wf_use_avx2(void)
+{
+	if (wf_has_avx2 < 0) wf_has_avx2 = __builtin_cpu_supports("avx2");
+	return wf_has_avx2;
+}
+#else
+#define WF_KERNEL static inline
+#endif
+
 static void wf_next_prep(void *km, const mwf_opt_t *opt, wf_stripe_t *wf, int32_t lo, int32_t hi,
 						 int32_t **H, int32_t **E1, int32_t **F1, int32_t **E2, int32_t **F2,
 						 const int32_t **pHx, const int32_t **pHo1, const int32_t **pHo2,
@@ -258,9 +274,9 @@ static void wf_next_prep(void *km, const mwf_opt_t *opt, wf_stripe_t *wf, int32_
 	*H = ft->H, *E1 = ft->E1, *E2 = ft->E2, *F1 = ft->F1, *F2 = ft->F2;
 }
 
-static void wf_next_score(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
-						  const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
-						  const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+WF_KERNEL void wf_next_score_core(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
+								  const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+								  const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
 {
 	int32_t d;
 	PRAGMA_LOOP_VECTORIZE
@@ -278,9 +294,9 @@ static void wf_next_score(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32
 	}
 }
 
-static void wf_next_tb(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2, uint8_t *ax,
-					   const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
-					   const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+WF_KERNEL void wf_next_tb_core(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2, uint8_t *ax,
+							   const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+							   const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
 {
 	int32_t d;
 	PRAGMA_LOOP_VECTORIZE
@@ -305,6 +321,99 @@ static void wf_next_tb(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t 
 		H[d] = wf_max(pHx[d] + 1, h);
 		ax[d] = x | z;
 	}
+}
+
+// In the low-memory mode, propagate the snapshot ancestry along the traceback bits in ax[]
+WF_KERNEL void wf_next_sf_core(int32_t lo, int32_t hi, const uint8_t *ax, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
+							   const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+							   const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+	int32_t d;
+	PRAGMA_LOOP_VECTORIZE
+	for (d = lo; d <= hi; ++d) { // FIXME: merge this loop into the loop in wf_next_tb(). I tried but couldn't make clang vectorize.
+		uint8_t x = ax[d];
+		int32_t a, b, e1, f1, e2, f2, h;
+		a = pHo1[d-1], b = pE1[d-1];
+		e1 = E1[d] = (x&0x08) == 0? a : b;
+		a = pHo1[d+1], b = pF1[d+1];
+		f1 = F1[d] = (x&0x10) == 0? a : b;
+		a = pHo2[d-1], b = pE2[d-1];
+		e2 = E2[d] = (x&0x20) == 0? a : b;
+		a = pHo2[d+1], b = pF2[d+1];
+		f2 = F2[d] = (x&0x40) == 0? a : b;
+		x &= 7; // select without ?: as gcc doesn't if-convert a 5-way PHI
+		h = pHx[d];
+		h ^= (h ^ e1) & -(int32_t)(x == 1);
+		h ^= (h ^ f1) & -(int32_t)(x == 2);
+		h ^= (h ^ e2) & -(int32_t)(x == 3);
+		h ^= (h ^ f2) & -(int32_t)(x == 4);
+		H[d] = h;
+	}
+}
+
+#ifdef WF_AVX2_TWIN
+__attribute__((target("avx2")))
+static void wf_next_score_avx2(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
+							   const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+							   const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+	wf_next_score_core(lo, hi, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+}
+
+__attribute__((target("avx2")))
+static void wf_next_tb_avx2(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2, uint8_t *ax,
+							const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+							const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+	wf_next_tb_core(lo, hi, H, E1, F1, E2, F2, ax, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+}
+
+__attribute__((target("avx2")))
+static void wf_next_sf_avx2(int32_t lo, int32_t hi, const uint8_t *ax, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
+							const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+							const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+	wf_next_sf_core(lo, hi, ax, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+}
+#endif
+
+static void wf_next_score(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
+						  const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+						  const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+#ifdef WF_AVX2_TWIN
+	if (wf_use_avx2()) {
+		wf_next_score_avx2(lo, hi, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+		return;
+	}
+#endif
+	wf_next_score_core(lo, hi, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+}
+
+static void wf_next_tb(int32_t lo, int32_t hi, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2, uint8_t *ax,
+					   const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+					   const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+#ifdef WF_AVX2_TWIN
+	if (wf_use_avx2()) {
+		wf_next_tb_avx2(lo, hi, H, E1, F1, E2, F2, ax, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+		return;
+	}
+#endif
+	wf_next_tb_core(lo, hi, H, E1, F1, E2, F2, ax, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+}
+
+static void wf_next_sf(int32_t lo, int32_t hi, const uint8_t *ax, int32_t *H, int32_t *E1, int32_t *F1, int32_t *E2, int32_t *F2,
+					   const int32_t *pHx, const int32_t *pHo1, const int32_t *pHo2,
+					   const int32_t *pE1, const int32_t *pF1, const int32_t *pE2, const int32_t *pF2)
+{
+#ifdef WF_AVX2_TWIN
+	if (wf_use_avx2()) {
+		wf_next_sf_avx2(lo, hi, ax, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
+		return;
+	}
+#endif
+	wf_next_sf_core(lo, hi, ax, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
 }
 
 /*
@@ -494,33 +603,14 @@ static void wf_snapshot_free(void *km, wf_sss_t *sss)
 
 static void wf_next_seg(void *km, const mwf_opt_t *opt, uint8_t *xbuf, wf_stripe_t *wf, wf_stripe_t *sf, int32_t lo, int32_t hi)
 {
-	int32_t d, *H, *E1, *E2, *F1, *F2;
+	int32_t *H, *E1, *E2, *F1, *F2;
 	const int32_t *pHx, *pHo1, *pHo2, *pE1, *pE2, *pF1, *pF2;
 	uint8_t *ax = xbuf - lo;
 
 	wf_next_prep(km, opt, wf, lo, hi, &H, &E1, &F1, &E2, &F2, &pHx, &pHo1, &pHo2, &pE1, &pF1, &pE2, &pF2);
 	wf_next_tb(lo, hi, H, E1, F1, E2, F2, ax, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
 	wf_next_prep(km, opt, sf, lo, hi, &H, &E1, &F1, &E2, &F2, &pHx, &pHo1, &pHo2, &pE1, &pF1, &pE2, &pF2);
-	PRAGMA_LOOP_VECTORIZE
-	for (d = lo; d <= hi; ++d) { // FIXME: merge this loop into the loop in wf_next_tb(). I tried but couldn't make clang vectorize.
-		uint8_t x = ax[d];
-		int32_t a, b, e1, f1, e2, f2, h;
-		a = pHo1[d-1], b = pE1[d-1];
-		e1 = E1[d] = (x&0x08) == 0? a : b;
-		a = pHo1[d+1], b = pF1[d+1];
-		f1 = F1[d] = (x&0x10) == 0? a : b;
-		a = pHo2[d-1], b = pE2[d-1];
-		e2 = E2[d] = (x&0x20) == 0? a : b;
-		a = pHo2[d+1], b = pF2[d+1];
-		f2 = F2[d] = (x&0x40) == 0? a : b;
-		x &= 7;
-		h = pHx[d];
-		h = x == 1? e1 : h;
-		h = x == 2? f1 : h;
-		h = x == 3? e2 : h;
-		h = x == 4? f2 : h;
-		H[d] = h;
-	}
+	wf_next_sf(lo, hi, ax, H, E1, F1, E2, F2, pHx, pHo1, pHo2, pE1, pF1, pE2, pF2);
 	if (H[lo] >= -1 || E1[lo] >= -1 || F1[lo] >= -1 || E2[lo] >= -1 || F2[lo] >= -1) wf->lo = lo;
 	if (H[hi] >= -1 || E1[hi] >= -1 || F1[hi] >= -1 || E2[hi] >= -1 || F2[hi] >= -1) wf->hi = hi;
 }
@@ -850,16 +940,19 @@ static int32_t wf_anchor_filter(int32_t n, uint64_t *a, int32_t tl, int32_t ql, 
 	return m;
 }
 
-void mwf_wfa_chain(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, mwf_rst_t *r)
+static int32_t wf_chain_anchors(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, uint64_t **a)
 {
-	int32_t n_a, i, x0, y0;
-	uint64_t *a;
-	void *km_wfa;
+	int32_t n_a;
+	*a = mg_chain(km, tl, ts, ql, qs, opt->kmer, opt->max_occ, &n_a);
+	return wf_anchor_filter(n_a, *a, tl, ql, opt->kmer, opt->min_len);
+}
+
+// Close the gaps between anchors. Without anchors, this is the exact alignment of the whole gap.
+static void wf_chain_core(void *km, void *km_wfa, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, int32_t n_a, const uint64_t *a, mwf_rst_t *r)
+{
+	int32_t i, x0, y0;
 	wf_cigar_t c = {0,0,0};
 
-	km_wfa = !(opt->flag&MWF_F_NO_KALLOC)? km_init2(km, 0) : 0;
-	a = mg_chain(km_wfa, tl, ts, ql, qs, opt->kmer, opt->max_occ, &n_a);
-	n_a = wf_anchor_filter(n_a, a, tl, ql, opt->kmer, opt->min_len);
 	r->s = 0;
 	for (i = 0, x0 = y0 = 0; i <= n_a; ++i) {
 		int32_t x1, y1;
@@ -877,7 +970,13 @@ void mwf_wfa_chain(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, i
 				r->s += opt->o2 * 2 + opt->e2 * ((x1 - x0) + (y1 - y0));
 			} else {
 				mwf_rst_t q;
-				mwf_wfa_exact(km_wfa, opt, x1 - x0, &ts[x0], y1 - y0, &qs[y0], &q);
+				q.s = -1;
+				if (opt->step > 0 && opt->sub_iter > 0) { // try the standard mode first; it gives the same alignment when it finishes
+					mwf_opt_t opt1 = *opt;
+					opt1.step = 0, opt1.max_iter = opt->sub_iter;
+					mwf_wfa_exact(km_wfa, &opt1, x1 - x0, &ts[x0], y1 - y0, &qs[y0], &q);
+				}
+				if (q.s < 0) mwf_wfa_exact(km_wfa, opt, x1 - x0, &ts[x0], y1 - y0, &qs[y0], &q);
 				if (opt->flag&MWF_F_CIGAR)
 					wf_cigar_push(km, &c, q.n_cigar, q.cigar);
 				r->s += q.s;
@@ -892,20 +991,48 @@ void mwf_wfa_chain(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, i
 		}
 		x0 = x1, y0 = y1;
 	}
-	if (km_wfa == 0) kfree(km_wfa, a);
-	km_destroy(km_wfa);
 	r->n_cigar = c.n, r->cigar = c.cigar;
 	r->cigar = (uint32_t*)krelocate(km, r->cigar, r->n_cigar * sizeof(*r->cigar));
+}
+
+void mwf_wfa_chain(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, mwf_rst_t *r)
+{
+	int32_t n_a;
+	uint64_t *a;
+	void *km_wfa;
+
+	km_wfa = !(opt->flag&MWF_F_NO_KALLOC)? km_init2(km, 0) : 0;
+	n_a = wf_chain_anchors(km_wfa, opt, tl, ts, ql, qs, &a);
+	wf_chain_core(km, km_wfa, opt, tl, ts, ql, qs, n_a, a, r);
+	if (km_wfa == 0) kfree(km_wfa, a);
+	km_destroy(km_wfa);
+}
+
+static inline int64_t wf_gap_pen(const mwf_opt_t *opt, int32_t len)
+{
+	int64_t s1 = opt->o1 + (int64_t)opt->e1 * len, s2 = opt->o2 + (int64_t)opt->e2 * len;
+	return s1 < s2? s1 : s2;
 }
 
 void mwf_wfa_auto(void *km, const mwf_opt_t *opt0, int32_t tl, const char *ts, int32_t ql, const char *qs, mwf_rst_t *r)
 {
 	mwf_opt_t opt = *opt0;
+	int32_t n_a = -1;
+	uint64_t *a = 0;
+	void *km_wfa;
+
+	km_wfa = !(opt.flag&MWF_F_NO_KALLOC)? km_init2(km, 0) : 0;
 	opt.step = 0, opt.max_iter = 100000000;
-	mwf_wfa_exact(km, &opt, tl, ts, ql, qs, r);
+	if ((wf_gap_pen(&opt, tl) + wf_gap_pen(&opt, ql)) * (tl + ql + 1) > opt.max_iter) // exact WFA may exceed max_iter; chain first
+		n_a = wf_chain_anchors(km_wfa, &opt, tl, ts, ql, qs, &a);
+	if (n_a == 0) memset(r, 0, sizeof(*r)), r->s = -1; // no anchors: the chain mode is the exact alignment anyway; skip the capped attempt
+	else mwf_wfa_exact(km, &opt, tl, ts, ql, qs, r);
 	if (r->s < 0) {
+		if (n_a < 0) n_a = wf_chain_anchors(km_wfa, &opt, tl, ts, ql, qs, &a);
 		if (opt.flag & MWF_F_CIGAR) opt.step = 5000;
 		opt.max_iter = -1;
-		mwf_wfa_chain(km, &opt, tl, ts, ql, qs, r);
+		wf_chain_core(km, km_wfa, &opt, tl, ts, ql, qs, n_a, a, r);
 	}
+	if (km_wfa == 0) kfree(km_wfa, a);
+	km_destroy(km_wfa);
 }
