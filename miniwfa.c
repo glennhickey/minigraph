@@ -600,12 +600,89 @@ wf_chkpt_t *mwf_wfa_seg(void *km, const mwf_opt_t *opt, int32_t tl, const char *
 	return seg;
 }
 
+/*
+ * Shortcut for a gap where, after trimming the exact prefix (p) and suffix (q), one side is a run of 'N' and the other
+ * side has no 'N'. As 'N' matches nothing, the optimal alignment deletes the N run and inserts the other middle, with
+ * score 2*o2+e2*(tm+qm) (assuming the default scoring and tm,qm>=16); it is only ambiguous in the placement of the two
+ * gaps, which is resolved as wf_traceback() would. max_s and max_iter are honored by bounding the number of cells the
+ * full WFA would visit. Return 0 if the shortcut does not apply.
+ */
+static int wf_ngap(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, mwf_rst_t *r)
+{
+	int32_t i, n, p, q, tm, qm, nm, nl, rl, a, b, s, in_t;
+	const char *N, *R, *T;
+	wf_cigar_t c = {0,0,0};
+
+	if (opt->x != 4 || opt->o1 != 4 || opt->e1 != 2 || opt->o2 != 15 || opt->e2 != 1) return 0;
+	in_t = (memchr(ts, 'N', tl) != 0);
+	if (in_t == (memchr(qs, 'N', ql) != 0)) return 0; // exactly one side has 'N'
+	for (p = 0; p < tl && p < ql && ts[p] == qs[p]; ++p) {}
+	for (q = 0; p + q < tl && p + q < ql && ts[tl-1-q] == qs[ql-1-q]; ++q) {}
+	tm = tl - p - q, qm = ql - p - q;
+	if (tm < 16 || qm < 16) return 0; // mismatches could be cheaper than two gaps
+	if (in_t) N = ts, nl = tl, nm = tm, R = qs + p, rl = qm;
+	else N = qs, nl = ql, nm = qm, R = ts + p, rl = tm;
+	for (i = 0, n = 0; i < nl; ++i) n += (N[i] == 'N');
+	if (n != nm) return 0; // the middle of the N side is not all 'N'
+	s = 2 * opt->o2 + opt->e2 * (tm + qm);
+	memset(r, 0, sizeof(*r));
+	if (opt->max_s > 0 && s > opt->max_s) {
+		r->s = -1;
+		return 1;
+	}
+	if (opt->max_iter > 0) {
+		// The band grows by one diagonal per side per score until clamped, and wf_stripe_shrink() only drops a diagonal
+		// after a path of the current score could have left the matrix on it. This gives an upper and a lower bound.
+		int64_t lo = 0, hi = 0;
+		for (i = 1; i <= s; ++i) {
+			int32_t w = i >= 27? i - 15 : i >= 7? (i - 3) / 2 : 1; // max half-width at score i
+			int32_t l = w < tl? -w : -tl, h = w < ql? w : ql;
+			hi += h - l + 1;
+			if (l < i - 14 - 2 * tm) l = i - 14 - 2 * tm;
+			if (h > 2 * qm + 14 - i) h = 2 * qm + 14 - i;
+			if (h >= l) lo += h - l + 1;
+		}
+		if (lo > opt->max_iter) {
+			r->s = -1;
+			return 1;
+		}
+		if (hi > opt->max_iter) return 0; // undecided
+	}
+	r->s = s;
+	if (!(opt->flag & MWF_F_CIGAR)) return 1;
+	T = ts + tl - q; // the suffix
+	for (a = 0; a < q && a < rl && T[a] == R[a]; ++a) {} // the gap after the N run may slide right by a
+	if (in_t) { // N run on the target: deletion, then insertion
+		if (p) wf_cigar_push1(km, &c, 7, p);
+		wf_cigar_push1(km, &c, 2, tm);
+		if (a == q && q) wf_cigar_push1(km, &c, 7, q);
+		wf_cigar_push1(km, &c, 1, qm);
+		if (a < q) wf_cigar_push1(km, &c, 7, q);
+	} else if (a == 0) { // N run on the query: deletion, then insertion; the deletion may slide left by b
+		for (b = 0; b < p && b < tm && ts[p-1-b] == R[tm-1-b]; ++b) {}
+		if (p - b) wf_cigar_push1(km, &c, 7, p - b);
+		wf_cigar_push1(km, &c, 2, tm);
+		if (b) wf_cigar_push1(km, &c, 7, b);
+		wf_cigar_push1(km, &c, 1, qm);
+		if (q) wf_cigar_push1(km, &c, 7, q);
+	} else { // N run on the query: insertion, then deletion
+		if (p) wf_cigar_push1(km, &c, 7, p);
+		wf_cigar_push1(km, &c, 1, qm);
+		if (a == q) wf_cigar_push1(km, &c, 7, q);
+		wf_cigar_push1(km, &c, 2, tm);
+		if (a < q) wf_cigar_push1(km, &c, 7, q);
+	}
+	r->cigar = c.cigar, r->n_cigar = c.n;
+	return 1;
+}
+
 void mwf_wfa_exact(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, mwf_rst_t *r)
 {
 	int32_t n_seg = 0;
 	wf_chkpt_t *seg = 0;
 	char *pts, *pqs;
 
+	if (wf_ngap(km, opt, tl, ts, ql, qs, r)) return;
 	wf_pad_str(km, tl, ts, ql, qs, &pts, &pqs);
 	if (opt->step > 0)
 		seg = mwf_wfa_seg(km, opt, tl, pts, ql, pqs, &n_seg);
