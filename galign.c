@@ -2,6 +2,7 @@
 #include <string.h>
 #include "mgpriv.h"
 #include "kalloc.h"
+#include "kthread.h"
 #include "miniwfa.h"
 
 /******************
@@ -36,13 +37,225 @@ static void append_cigar(void *km, mg64_v *c, int32_t n_cigar, const uint32_t *c
 	c->n += n_cigar - 1;
 }
 
-void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt, const char *qname) // qname for debugging only
+// find the llchain that contains anchor _ai_, searching from _l0_ as the serial loop does
+static inline int32_t cigar_find_lc(const mg_gchains_t *gt, int32_t l_end, int32_t l0, int32_t ai)
+{
+	int32_t l;
+	for (l = l0; l < l_end; ++l) {
+		const mg_llchain_t *r = &gt->lc[l];
+		if (ai >= r->off && ai < r->off + r->cnt)
+			break;
+	}
+	assert(l < l_end);
+	return l;
+}
+
+// length of the target sequence between the anchor at qx on lc[l0] and the anchor at px on lc[l]
+static inline int32_t cigar_tlen(const gfa_t *g, const gfa_edseq_t *es, const mg_gchains_t *gt, int32_t l0, int32_t l, int32_t qx, int32_t px)
+{
+	int32_t k, l_seq;
+	if (l == l0) { // on the same vertex
+		l_seq = px - qx;
+	} else {
+		l_seq = g->seg[gt->lc[l0].v>>1].len - qx - 1;
+		for (k = l0 + 1; k < l; ++k)
+			l_seq += es[gt->lc[k].v].len;
+		l_seq += px + 1;
+	}
+	return l_seq;
+}
+
+// concatenate the vertex sequences between the two anchors into *seq, growing it as needed; returns the length
+static int32_t cigar_tseq(void *km, const gfa_t *g, const gfa_edseq_t *es, const mg_gchains_t *gt, int32_t l0, int32_t l, int32_t qx, int32_t px, char **seq, int32_t *m_seq)
+{
+	int32_t k, l_seq;
+	l_seq = cigar_tlen(g, es, gt, l0, l, qx, px);
+	if (l_seq + 1 > *m_seq) {
+		*m_seq = l_seq + 1;
+		kroundup32(*m_seq);
+		KREALLOC(km, *seq, *m_seq);
+	}
+	if (l == l0) { // on the same vertex
+		memcpy(*seq, &es[gt->lc[l0].v].seq[qx + 1], l_seq);
+	} else {
+		uint32_t v = gt->lc[l0].v;
+		l_seq = g->seg[v>>1].len - qx - 1;
+		memcpy(*seq, &es[v].seq[qx + 1], l_seq);
+		for (k = l0 + 1; k < l; ++k) {
+			v = gt->lc[k].v;
+			memcpy(&(*seq)[l_seq], es[v].seq, es[v].len);
+			l_seq += es[v].len;
+		}
+		memcpy(&(*seq)[l_seq], es[gt->lc[l].v].seq, px + 1);
+		l_seq += px + 1;
+	}
+	return l_seq;
+}
+
+// save the CIGAR to gc and derive its statistics, exactly as the serial code does
+static void cigar_save(mg_gchains_t *gt, mg_gchain_t *gc, int32_t off_a0, const mg64_v *cigar)
+{
+	int32_t j, l;
+	gc->p = (mg_cigar_t*)kcalloc(gt->km, 1, cigar->n * 8 + sizeof(mg_cigar_t));
+	gc->p->ss = (int32_t)gt->a[off_a0].x + 1 - (int32_t)(gt->a[off_a0].y>>32&0xff);
+	gc->p->ee = (int32_t)gt->a[off_a0 + gc->n_anchor - 1].x + 1;
+	gc->p->n_cigar = cigar->n;
+	memcpy(gc->p->cigar, cigar->a, cigar->n * 8);
+	for (j = 0, l = 0; j < gc->p->n_cigar; ++j) {
+		int32_t op = gc->p->cigar[j]&0xf, len = gc->p->cigar[j]>>4;
+		if (op == 7) gc->p->mlen += len, gc->p->blen += len;
+		else gc->p->blen += len;
+		if (op != 1) gc->p->aplen += len;
+		if (op != 2) l += len;
+	}
+	memset(&gc->ds, 0, sizeof(gc->ds));
+	assert(l == gc->qe - gc->qs && gc->p->aplen == gc->pe - gc->ps);
+}
+
+/*****************************************************************************
+ * Aligning the anchor gaps of one query in parallel
+ *
+ * mg_gchain_cigar() walks the anchors of every gchain in order and appends one
+ * CIGAR piece per anchor gap. Nearly all the time is in mwf_wfa_auto(), which
+ * is a pure function of the target sequence between the two anchors and the
+ * query between them: it allocates only from the arena it is handed and its
+ * only output is the CIGAR. Everything else - finding the containing llchain,
+ * measuring the target, and the three fixed-op shortcuts - is cheap, and only
+ * the appending is order-dependent.
+ *
+ * So split the loop in three. Phase A (serial) walks the anchors exactly as
+ * the core loop does and lists only the gaps that reach the alignment branch,
+ * recording the two llchains and the two lengths. Phase B aligns them with
+ * kt_for(), each thread rebuilding its own target sequence in a private buffer
+ * and aligning in a private malloc-backed arena, and keeps a copy of the
+ * CIGAR. Phase C is the original loop, except that the alignment branch
+ * replays the recorded CIGAR through the same append_cigar() call instead of
+ * aligning, and the target sequence is only measured, not built. The pieces
+ * are appended in the same order by the same code, so the stored CIGAR is
+ * byte-identical whatever the thread count. With n_threads <= 1 there is no
+ * Phase A or B and the core loop is the original code.
+ *****************************************************************************/
+
+#define MG_CIGAR_PAR_MIN_TASK 16 // don't start threads for fewer alignments than this
+
+typedef struct { // one anchor gap gt->a[off_a0+j0] -> gt->a[off_a0+j] that needs an alignment
+	int32_t gc_i;         // the gchain this gap belongs to; the tasks are in gchain and anchor order
+	int32_t off_a0;       // gt->lc[gc->off].off
+	int32_t j0, j;        // anchor indices within the gchain
+	int32_t l0, l;        // the llchains containing the two anchors
+	int32_t l_seq, qlen;  // target and query length of the gap
+	int32_t n_cigar;      // Phase B output
+	uint32_t *cigar;      // Phase B output, allocated from the worker's arena
+} cigar_task_t;
+
+typedef struct {
+	void *km_out;   // holds the CIGAR copies until Phase C; lives to the end
+	void *km_wfa;   // mwf_wfa_auto() scratch; recycled after a big alignment, as km2 is in the serial code
+	char *seq;      // target sequence buffer, malloc-backed
+	int32_t m_seq;
+} cigar_worker_t;
+
+typedef struct {
+	const gfa_t *g;
+	const gfa_edseq_t *es;
+	const mg_gchains_t *gt;
+	const char *qseq, *qname;
+	cigar_task_t *task;
+	cigar_worker_t *w;   // one per thread
+} cigar_par_t;
+
+static void cigar_worker(void *data, long k, int tid) // kt_for() callback: one alignment per call
+{
+	cigar_par_t *cp = (cigar_par_t*)data;
+	cigar_worker_t *w = &cp->w[tid];
+	cigar_task_t *t = &cp->task[k];
+	const mg128_t *q = &cp->gt->a[t->off_a0 + t->j0];
+	const char *qs = &cp->qseq[(int32_t)q->y + 1];
+	mwf_opt_t opt;
+	mwf_rst_t rst;
+	int32_t l_seq;
+	if (w->km_out == 0) w->km_out = km_init(); // malloc-backed; the caller's arena is not thread-safe
+	if (w->km_wfa == 0) w->km_wfa = km_init();
+	l_seq = cigar_tseq(0, cp->g, cp->es, cp->gt, t->l0, t->l, (int32_t)q->x, (int32_t)cp->gt->a[t->off_a0 + t->j].x, &w->seq, &w->m_seq);
+	assert(l_seq == t->l_seq);
+	mwf_opt_init(&opt);
+	opt.flag |= MWF_F_CIGAR;
+	mwf_wfa_auto(w->km_wfa, &opt, l_seq, w->seq, t->qlen, qs, &rst);
+	t->n_cigar = rst.n_cigar;
+	if (rst.n_cigar > 0) { // keep the CIGAR for Phase C
+		KMALLOC(w->km_out, t->cigar, rst.n_cigar);
+		memcpy(t->cigar, rst.cigar, rst.n_cigar * 4);
+	}
+	kfree(w->km_wfa, rst.cigar);
+	if ((mg_dbg_flag&MG_DBG_MINIWFA) && l_seq > 5000 && t->qlen > 5000 && rst.s >= 10000)
+		fprintf(stderr, "WL\t%s\t%d\t%d\t%d\t%d\t%d\n", cp->qname, t->gc_i, (int32_t)q->y + 1, t->qlen, l_seq, rst.s);
+	if ((mg_dbg_flag&MG_DBG_MWF_SEQ) && l_seq > 5000 && t->qlen > 5000 && rst.s >= 10000) {
+		char *str;
+		int32_t n;
+		str = Kmalloc(w->km_wfa, char, t->qlen + l_seq + strlen(cp->qname) + 100);
+		n = sprintf(str, "WL\t%s\t%d\t%d\t%d\nWT\t%.*s\nWQ\t%.*s\n", cp->qname, t->gc_i, (int32_t)q->y + 1, rst.s, l_seq, w->seq, t->qlen, qs);
+		fwrite(str, 1, n, stderr);
+		kfree(w->km_wfa, str);
+	}
+	if (rst.s >= 10000 && l_seq > 5000 && t->qlen > 5000) { // the memory hygiene heuristic of the serial code, per worker
+		km_destroy(w->km_wfa);
+		w->km_wfa = km_init();
+	}
+}
+
+// With n_threads > 1 the gaps that need an alignment are aligned in parallel; the CIGAR does not depend on n_threads.
+void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt, const char *qname, int n_threads) // qname for debugging only
 {
 	int32_t i, l_seq = 0, m_seq = 0;
+	int32_t par, n_task = 0, m_task = 0, ti = 0, nt = 0;
 	char *seq = 0;
-	void *km2;
+	void *km2 = 0;
+	cigar_task_t *task = 0;
+	cigar_worker_t *w = 0;
 	mg64_v cigar = {0,0,0};
-	km2 = km_init2(km, 0);
+
+	par = (n_threads > 1);
+	if (par) {
+		// Phase A: walk the anchors exactly as the core loop below does and list the gaps that need an alignment
+		for (i = 0; i < gt->n_gc; ++i) {
+			const mg_gchain_t *gc = &gt->gc[i];
+			int32_t l0 = gc->off;
+			int32_t off_a0 = gt->lc[l0].off;
+			int32_t j, j0 = 0, l;
+			for (j = 1; j < gc->n_anchor; ++j) {
+				const mg128_t *q, *p = &gt->a[off_a0 + j];
+				int32_t qlen;
+				if ((p->y & MG_SEED_IGNORE) && j != gc->n_anchor - 1) continue;
+				q = &gt->a[off_a0 + j0];
+				l = cigar_find_lc(gt, gc->off + gc->cnt, l0, off_a0 + j);
+				l_seq = cigar_tlen(g, es, gt, l0, l, (int32_t)q->x, (int32_t)p->x);
+				qlen = (int32_t)p->y - (int32_t)q->y;
+				if (l_seq > 0 && qlen > 0 && !(l_seq == qlen && qlen <= (q->y>>32&0xff))) { // the "else" branch of the core loop
+					cigar_task_t *t;
+					if (n_task == m_task) KEXPAND(km, task, m_task);
+					t = &task[n_task++];
+					t->gc_i = i, t->off_a0 = off_a0, t->j0 = j0, t->j = j, t->l0 = l0, t->l = l;
+					t->l_seq = l_seq, t->qlen = qlen;
+					t->n_cigar = 0, t->cigar = 0;
+				}
+				j0 = j, l0 = l;
+			}
+		}
+		// Phase B: align the listed gaps, each thread in its own arena
+		if (n_task > 0) {
+			cigar_par_t cp;
+			nt = n_task >= MG_CIGAR_PAR_MIN_TASK? n_threads : 1;
+			if (nt > n_task) nt = n_task;
+			KCALLOC(km, w, nt);
+			memset(&cp, 0, sizeof(cp));
+			cp.g = g, cp.es = es, cp.gt = gt, cp.qseq = qseq, cp.qname = qname, cp.task = task, cp.w = w;
+			if (nt > 1) kt_for(nt, cigar_worker, &cp, n_task);
+			else for (i = 0; i < n_task; ++i) cigar_worker(&cp, i, 0);
+		}
+		if (mg_dbg_flag & MG_DBG_LC_PROF) fprintf(stderr, "CP\t%s\tn_aln=%d\tnt=%d\n", qname, n_task, nt);
+	} else km2 = km_init2(km, 0);
+
+	// core loop (Phase C when par: the recorded CIGARs are replayed instead of aligned here)
 	for (i = 0; i < gt->n_gc; ++i) {
 		mg_gchain_t *gc = &gt->gc[i];
 		int32_t l0 = gc->off;
@@ -54,43 +267,11 @@ void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char
 			const mg128_t *q, *p = &gt->a[off_a0 + j];
 			if ((p->y & MG_SEED_IGNORE) && j != gc->n_anchor - 1) continue;
 			q = &gt->a[off_a0 + j0];
-			// find the lchain that contains the anchor
-			for (l = l0; l < gc->off + gc->cnt; ++l) {
-				mg_llchain_t *r = &gt->lc[l];
-				if (off_a0 + j >= r->off && off_a0 + j < r->off + r->cnt)
-					break;
-			}
-			assert(l < gc->off + gc->cnt);
+			l = cigar_find_lc(gt, gc->off + gc->cnt, l0, off_a0 + j); // find the lchain that contains the anchor
 			assert((int32_t)q->x < g->seg[gt->lc[l0].v>>1].len);
-			// calculate the target sequence length
-			if (l == l0) {
-				l_seq = (int32_t)p->x - (int32_t)q->x;
-			} else {
-				l_seq = g->seg[gt->lc[l0].v>>1].len - (int32_t)q->x - 1;
-				for (k = l0 + 1; k < l; ++k)
-					l_seq += es[gt->lc[k].v].len;
-				l_seq += (int32_t)p->x + 1;
-			}
-			if (l_seq + 1 > m_seq) {
-				m_seq = l_seq + 1;
-				kroundup32(m_seq);
-				KREALLOC(km, seq, m_seq);
-			}
-			// get the target sequence
-			if (l == l0) { // on the same vertex
-				memcpy(seq, &es[gt->lc[l0].v].seq[(int32_t)q->x + 1], l_seq);
-			} else {
-				uint32_t v = gt->lc[l0].v;
-				l_seq = g->seg[v>>1].len - (int32_t)q->x - 1;
-				memcpy(seq, &es[v].seq[(int32_t)q->x + 1], l_seq);
-				for (k = l0 + 1; k < l; ++k) {
-					v = gt->lc[k].v;
-					memcpy(&seq[l_seq], es[v].seq, es[v].len);
-					l_seq += es[v].len;
-				}
-				memcpy(&seq[l_seq], es[gt->lc[l].v].seq, (int32_t)p->x + 1);
-				l_seq += (int32_t)p->x + 1;
-			}
+			// get the target sequence; under par only its length is needed, the workers build their own
+			l_seq = par? cigar_tlen(g, es, gt, l0, l, (int32_t)q->x, (int32_t)p->x)
+					   : cigar_tseq(km, g, es, gt, l0, l, (int32_t)q->x, (int32_t)p->x, &seq, &m_seq);
 			{
 				int32_t qlen = (int32_t)p->y - (int32_t)q->y;
 				const char *qs = &qseq[(int32_t)q->y + 1];
@@ -98,7 +279,11 @@ void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char
 				if (l_seq == 0) append_cigar1(km, &cigar, 1, qlen);
 				else if (qlen == 0) append_cigar1(km, &cigar, 2, l_seq);
 				else if (l_seq == qlen && qlen <= (q->y>>32&0xff)) append_cigar1(km, &cigar, 7, qlen);
-				else {
+				else if (par) { // replay the CIGAR computed in Phase B; the tasks are in walk order
+					const cigar_task_t *t = &task[ti++];
+					assert(ti <= n_task && t->gc_i == i && t->j0 == j0 && t->j == j);
+					append_cigar(km, &cigar, t->n_cigar, t->cigar);
+				} else {
 					mwf_opt_t opt;
 					mwf_rst_t rst;
 					mwf_opt_init(&opt);
@@ -123,23 +308,18 @@ void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char
 			}
 			j0 = j, l0 = l;
 		}
-		// save the CIGAR to gt->gc[i]
-		gc->p = (mg_cigar_t*)kcalloc(gt->km, 1, cigar.n * 8 + sizeof(mg_cigar_t));
-		gc->p->ss = (int32_t)gt->a[off_a0].x + 1 - (int32_t)(gt->a[off_a0].y>>32&0xff);
-		gc->p->ee = (int32_t)gt->a[off_a0 + gc->n_anchor - 1].x + 1;
-		gc->p->n_cigar = cigar.n;
-		memcpy(gc->p->cigar, cigar.a, cigar.n * 8);
-		for (j = 0, l = 0; j < gc->p->n_cigar; ++j) {
-			int32_t op = gc->p->cigar[j]&0xf, len = gc->p->cigar[j]>>4;
-			if (op == 7) gc->p->mlen += len, gc->p->blen += len;
-			else gc->p->blen += len;
-			if (op != 1) gc->p->aplen += len;
-			if (op != 2) l += len;
-		}
-		memset(&gc->ds, 0, sizeof(gc->ds));
-		assert(l == gc->qe - gc->qs && gc->p->aplen == gc->pe - gc->ps);
+		cigar_save(gt, gc, off_a0, &cigar); // save the CIGAR to gt->gc[i]
 	}
-	km_destroy(km2);
+	assert(ti == n_task);
+
+	if (km2) km_destroy(km2);
+	for (i = 0; i < nt; ++i) { // the recorded CIGARs live in the worker arenas
+		if (w[i].km_out) km_destroy(w[i].km_out);
+		if (w[i].km_wfa) km_destroy(w[i].km_wfa);
+		free(w[i].seq);
+	}
+	kfree(km, w);
+	kfree(km, task);
 	kfree(km, seq);
 	kfree(km, cigar.a);
 }
