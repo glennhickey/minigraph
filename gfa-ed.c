@@ -276,7 +276,7 @@ typedef struct {
 } gwf_edbuf_t;
 
 /*
- * Hopeless wavefront detection
+ * Dropping the wavefronts that cannot reach the target
  */
 #define GWF_HE_MAX_POP 100000
 
@@ -331,32 +331,34 @@ static void gwf_build_he(gwf_edbuf_t *buf, const gfa_t *g, uint32_t v1, int32_t 
 	kfree(buf->km, heap.a);
 }
 
-// Return 1 iff no diagonal in a[] (all at score $s) can reach (v1,off1) at the end of the query with a score <= $s_term. A diagonal
-// (v,d,k) has R=ql-1-(d+k) query bases left and needs at least $rem more target bases, so its final score is >= s + max(0, rem - R).
-static int gwf_hopeless(gwf_edbuf_t *buf, const gfa_t *g, const gfa_edseq_t *es, int32_t n_a, const gwf_diag_t *a, int32_t ql, uint32_t v1, int32_t off1, int32_t s, int32_t s_term)
+// Compact a[] (all at score $s) down to the diagonals that can still reach (v1,off1) at the end of the query with a score <= $s_term;
+// a[] stays sorted by vd, as the callers require. A diagonal (v,d,k) has R=ql-1-(d+k) query bases left and needs at least $rem more
+// target bases, so its final score is >= s + max(0, rem - R). No transition lowers rem-R by more than it raises the score, so every
+// descendant of a dropped diagonal fails the same test: no path reaching (v1,off1) with a score <= $s_term goes through one.
+// A zero return means the entire wavefront is hopeless.
+static int32_t gwf_drop_infeasible(gwf_edbuf_t *buf, const gfa_t *g, const gfa_edseq_t *es, int32_t n_a, gwf_diag_t *a, int32_t ql, uint32_t v1, int32_t off1, int32_t s, int32_t s_term)
 {
-	int32_t i, budget = s_term - s;
+	int32_t i, j, budget = s_term - s;
 	int64_t radius = (int64_t)ql + s_term, E = -1;
 	uint32_t last_v = (uint32_t)-1;
 	if (radius > INT32_MAX) radius = INT32_MAX;
 	if (buf->he == 0 || buf->he_v1 != v1 || buf->he_off1 != off1 || buf->he_radius != radius)
 		gwf_build_he(buf, g, v1, off1, radius);
-	for (i = 0; i < n_a; ++i) {
+	if (!buf->he_full) return n_a; // the E map is incomplete due to GWF_HE_MAX_POP; keep everything
+	for (i = j = 0; i < n_a; ++i) {
 		uint32_t v = a[i].vd>>32;
 		int32_t k = a[i].k, d = (int32_t)a[i].vd - GWF_DIAG_SHIFT;
 		int64_t R = (int64_t)ql - 1 - (d + k), rem;
 		if (v != last_v) {
 			khint_t h = gwf_map64_get(buf->he, v);
-			if (h != kh_end(buf->he)) E = kh_val(buf->he, h);
-			else if (buf->he_full) E = -1; // (v1,off1) is not reachable from the end of v within the radius
-			else return 0; // unknown due to GWF_HE_MAX_POP
+			E = h != kh_end(buf->he)? (int64_t)kh_val(buf->he, h) : -1; // -1: (v1,off1) is not reachable from the end of v within the radius
 			last_v = v;
 		}
 		if (v == v1 && k <= off1) rem = off1 - k;
 		else rem = E < 0? -1 : E + (es[v].len - 1 - k);
-		if (rem >= 0 && rem - R <= budget) return 0;
+		if (rem >= 0 && rem - R <= budget) a[j++] = a[i];
 	}
-	return 1;
+	return j;
 }
 
 // remove diagonals not on the wavefront
@@ -677,8 +679,10 @@ void gfa_ed_step(void *z_, uint32_t v1, int32_t off1, int32_t s_term, gfa_edrst_
 		if (r->end_off >= 0 || z->n_a == 0) break;
 		if (r->n_end > 0) break;
 		if (s_term >= 0 && z->s >= s_term) break;
-		if (s_term >= 0 && v1 != (uint32_t)-1 && ((z->s+1)&0xf) == 0 && gwf_hopeless(&z->buf, z->g, z->es, z->n_a, z->a, z->ql, v1, off1, z->s + 1, s_term))
-			break; // the diagonals in z->a are at score z->s+1 and none of them can reach (v1,off1) with a score <= s_term
+		if (opt->drop_inf > 0 && s_term >= 0 && v1 != (uint32_t)-1 && (z->s + 1) % opt->drop_inf == 0) { // the diagonals in z->a are at score z->s+1
+			z->n_a = gwf_drop_infeasible(&z->buf, z->g, z->es, z->n_a, z->a, z->ql, v1, off1, z->s + 1, s_term);
+			if (z->n_a == 0) break; // none of them can reach (v1,off1) with a score <= s_term
+		}
 		if (z->opt->i_term > 0 && r->n_iter > z->opt->i_term) break;
 		++z->s;
 		if (gfa_ed_dbg >= 1) {
