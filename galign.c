@@ -174,8 +174,12 @@ static void cigar_worker(void *data, long k, int tid) // kt_for() callback: one 
 	mwf_opt_t opt;
 	mwf_rst_t rst;
 	int32_t l_seq;
-	if (w->km_out == 0) w->km_out = km_init(); // malloc-backed; the caller's arena is not thread-safe
-	if (w->km_wfa == 0) w->km_wfa = km_init();
+	// NB: km_init2(0,...) is malloc-backed, so the caller's arena - which is not thread-safe - is untouched.
+	// The core size is the 1MB of lchain.c rather than the 8MB default of km_init(): there are two of these
+	// arenas per worker and they are re-created for every query, so the default floor would reserve
+	// n_threads*16MB per query to hold a CIGAR list that is a few KB.
+	if (w->km_out == 0) w->km_out = km_init2(0, 0x10000);
+	if (w->km_wfa == 0) w->km_wfa = km_init2(0, 0x10000);
 	l_seq = cigar_tseq(0, cp->g, cp->es, cp->gt, t->l0, t->l, (int32_t)q->x, (int32_t)cp->gt->a[t->off_a0 + t->j].x, &w->seq, &w->m_seq);
 	assert(l_seq == t->l_seq);
 	mwf_opt_init(&opt);
@@ -199,7 +203,7 @@ static void cigar_worker(void *data, long k, int tid) // kt_for() callback: one 
 	}
 	if (rst.s >= 10000 && l_seq > 5000 && t->qlen > 5000) { // the memory hygiene heuristic of the serial code, per worker
 		km_destroy(w->km_wfa);
-		w->km_wfa = km_init();
+		w->km_wfa = km_init2(0, 0x10000);
 	}
 }
 
