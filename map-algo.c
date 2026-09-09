@@ -40,22 +40,29 @@ void mg_tbuf_set_par(mg_tbuf_t *b, int n_threads, volatile int64_t *rem_len)
 
 #define MG_LC_PAR_MIN_A 50000 // don't thread the chaining of a query with fewer anchors than this
 
-// Number of threads to give to the chaining of one query sequence. kt_for() has one task per
+// Number of threads to give to one stage of one query sequence. kt_for() has one task per
 // query sequence, so with few and very unequal sequences - 1-5 per file for per-chromosome
 // minigraph-cactus jobs - most threads sit idle. Give this sequence its share of the thread
 // budget by length, out of the sequences that have not finished yet; when it is the only one
 // left (or dominates the remaining work) it gets the whole budget.
-static int mg_lc_threads(const mg_tbuf_t *b, const mg_mapopt_t *opt, int64_t qlen, int64_t n_a)
+static int mg_par_threads(const mg_tbuf_t *b, const mg_mapopt_t *opt, int64_t qlen)
 {
 	int64_t rem, n;
 	if (opt->lc_threads > 0) return opt->lc_threads; // explicitly set with --lc-threads
-	if (b->n_threads <= 1 || b->rem_len == 0 || qlen <= 0 || n_a < MG_LC_PAR_MIN_A) return 1;
+	if (b->n_threads <= 1 || b->rem_len == 0 || qlen <= 0) return 1;
 	rem = *b->rem_len;
 	if (rem <= qlen) return b->n_threads;
 	n = ((int64_t)b->n_threads * qlen + rem - 1) / rem; // ceil of the fair share
 	if (n < 1) n = 1;
 	if (n > b->n_threads) n = b->n_threads;
 	return (int)n;
+}
+
+// threads for the linear chaining of one query; a query with few anchors is not worth threading
+static int mg_lc_threads(const mg_tbuf_t *b, const mg_mapopt_t *opt, int64_t qlen, int64_t n_a)
+{
+	if (opt->lc_threads <= 0 && n_a < MG_LC_PAR_MIN_A) return 1;
+	return mg_par_threads(b, opt, qlen);
 }
 
 static void collect_minimizers(void *km, const mg_mapopt_t *opt, const mg_idx_t *gi, int n_segs, const int *qlens, const char **seqs, mg128_v *mv)
@@ -518,7 +525,8 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	n_gc = mg_gchain1_dp(b->km, gi->g, &n_lc, lc, qlen_sum, opt->bw_long, opt->bw_long, opt->bw_long, opt->max_gc_skip, opt->ref_bonus,
 						 chn_pen_gap, chn_pen_skip, opt->mask_level, a, &u);
 	if (mg_dbg_flag & MG_DBG_QNAME) t = print_time(t, 3, qname);
-	gcs[0] = mg_gchain_gen(0, b->km, gi->g, gi->es, n_gc, u, lc, a, hash, opt->min_gc_cnt, opt->min_gc_score, opt->gdp_max_ed, n_segs, seq_cat);
+	gcs[0] = mg_gchain_gen(0, b->km, gi->g, gi->es, n_gc, u, lc, a, hash, opt->min_gc_cnt, opt->min_gc_score, opt->gdp_max_ed, n_segs, seq_cat,
+						   mg_par_threads(b, opt, qlen_sum)); // the gap-count threshold is inside
 	if (mg_dbg_flag & MG_DBG_QNAME) t = print_time(t, 4, qname);
 	gcs[0]->rep_len = rep_len;
 	kfree(b->km, a);

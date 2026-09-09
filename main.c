@@ -242,7 +242,7 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    --q-occ-frac FLOAT\n");
 		fprintf(fp_help, "                 ignore a query minimizer occurring in >FLOAT of query minimizers [%g]\n", opt.q_occ_frac);
 		fprintf(fp_help, "    --lc-threads INT\n");
-		fprintf(fp_help, "                 threads for chaining one query sequence; 0 for auto [%d]\n", opt.lc_threads);
+		fprintf(fp_help, "                 threads for chaining and bridging one query sequence; 0 for auto [%d]\n", opt.lc_threads);
 		fprintf(fp_help, "    -j FLOAT     expected sequence divergence [%g]\n", opt.div);
 		fprintf(fp_help, "    -g NUM       stop chain enlongation if there are no minimizers in INT-bp [%d]\n", opt.max_gap);
 		fprintf(fp_help, "    -F NUM       max fragment length (effective with -xsr or in the fragment mode) [%d]\n", opt.max_frag_len);
