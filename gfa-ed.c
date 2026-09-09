@@ -276,7 +276,7 @@ typedef struct {
 } gwf_edbuf_t;
 
 /*
- * Dropping the wavefronts that cannot reach the target
+ * Detecting - and optionally dropping - the wavefronts that cannot reach the target
  */
 #define GWF_HE_MAX_POP 100000
 
@@ -331,12 +331,14 @@ static void gwf_build_he(gwf_edbuf_t *buf, const gfa_t *g, uint32_t v1, int32_t 
 	kfree(buf->km, heap.a);
 }
 
-// Compact a[] (all at score $s) down to the diagonals that can still reach (v1,off1) at the end of the query with a score <= $s_term;
-// a[] stays sorted by vd, as the callers require. A diagonal (v,d,k) has R=ql-1-(d+k) query bases left and needs at least $rem more
-// target bases, so its final score is >= s + max(0, rem - R). No transition lowers rem-R by more than it raises the score, so every
-// descendant of a dropped diagonal fails the same test: no path reaching (v1,off1) with a score <= $s_term goes through one.
-// A zero return means the entire wavefront is hopeless.
-static int32_t gwf_drop_infeasible(gwf_edbuf_t *buf, const gfa_t *g, const gfa_edseq_t *es, int32_t n_a, gwf_diag_t *a, int32_t ql, uint32_t v1, int32_t off1, int32_t s, int32_t s_term)
+// Test every diagonal in a[] (all at score $s) for whether it can still reach (v1,off1) at the end of the query with a score
+// <= $s_term. A diagonal (v,d,k) has R=ql-1-(d+k) query bases left and needs at least $rem more target bases, so its final
+// score is >= s + max(0, rem - R). No transition lowers rem-R by more than it raises the score, so every descendant of an
+// infeasible diagonal fails the same test: no path reaching (v1,off1) with a score <= $s_term goes through one.
+// With $compact, a[] is compacted down to the feasible diagonals - it stays sorted by vd, as the callers require - and their
+// number is returned. Without it, a[] is left untouched and the scan stops at the first feasible diagonal, returning a
+// positive number. Either way a zero return means the whole wavefront is hopeless and the search can stop.
+static int32_t gwf_drop_infeasible(gwf_edbuf_t *buf, const gfa_t *g, const gfa_edseq_t *es, int32_t n_a, gwf_diag_t *a, int32_t ql, uint32_t v1, int32_t off1, int32_t s, int32_t s_term, int32_t compact)
 {
 	int32_t i, j, budget = s_term - s;
 	int64_t radius = (int64_t)ql + s_term, E = -1;
@@ -344,21 +346,26 @@ static int32_t gwf_drop_infeasible(gwf_edbuf_t *buf, const gfa_t *g, const gfa_e
 	if (radius > INT32_MAX) radius = INT32_MAX;
 	if (buf->he == 0 || buf->he_v1 != v1 || buf->he_off1 != off1 || buf->he_radius != radius)
 		gwf_build_he(buf, g, v1, off1, radius);
-	if (!buf->he_full) return n_a; // the E map is incomplete due to GWF_HE_MAX_POP; keep everything
+	if (compact && !buf->he_full) return n_a; // the E map is incomplete due to GWF_HE_MAX_POP; keep everything
 	for (i = j = 0; i < n_a; ++i) {
 		uint32_t v = a[i].vd>>32;
 		int32_t k = a[i].k, d = (int32_t)a[i].vd - GWF_DIAG_SHIFT;
 		int64_t R = (int64_t)ql - 1 - (d + k), rem;
 		if (v != last_v) {
 			khint_t h = gwf_map64_get(buf->he, v);
-			E = h != kh_end(buf->he)? (int64_t)kh_val(buf->he, h) : -1; // -1: (v1,off1) is not reachable from the end of v within the radius
+			if (h != kh_end(buf->he)) E = kh_val(buf->he, h);
+			else if (buf->he_full) E = -1; // (v1,off1) is not reachable from the end of v within the radius
+			else return n_a; // unknown due to GWF_HE_MAX_POP; keep everything
 			last_v = v;
 		}
 		if (v == v1 && k <= off1) rem = off1 - k;
 		else rem = E < 0? -1 : E + (es[v].len - 1 - k);
-		if (rem >= 0 && rem - R <= budget) a[j++] = a[i];
+		if (rem >= 0 && rem - R <= budget) {
+			if (!compact) return n_a; // feasible, so the wavefront is not hopeless; a[] must not be touched
+			a[j++] = a[i];
+		}
 	}
-	return j;
+	return compact? j : 0;
 }
 
 // remove diagonals not on the wavefront
@@ -679,9 +686,15 @@ void gfa_ed_step(void *z_, uint32_t v1, int32_t off1, int32_t s_term, gfa_edrst_
 		if (r->end_off >= 0 || z->n_a == 0) break;
 		if (r->n_end > 0) break;
 		if (s_term >= 0 && z->s >= s_term) break;
-		if (opt->drop_inf > 0 && s_term >= 0 && v1 != (uint32_t)-1 && (z->s + 1) % opt->drop_inf == 0) { // the diagonals in z->a are at score z->s+1
-			z->n_a = gwf_drop_infeasible(&z->buf, z->g, z->es, z->n_a, z->a, z->ql, v1, off1, z->s + 1, s_term);
-			if (z->n_a == 0) break; // none of them can reach (v1,off1) with a score <= s_term
+		if (s_term >= 0 && v1 != (uint32_t)-1) { // the diagonals in z->a are at score z->s+1
+			// The all-infeasible abort runs every 16 steps whatever drop_inf is, so setting the option cannot take it away;
+			// drop_inf only adds the compaction, on its own multiples.
+			int32_t comp = opt->drop_inf > 0 && (z->s + 1) % opt->drop_inf == 0;
+			if (comp || (z->s + 1) % 16 == 0) {
+				int32_t n = gwf_drop_infeasible(&z->buf, z->g, z->es, z->n_a, z->a, z->ql, v1, off1, z->s + 1, s_term, comp);
+				if (n == 0) break; // none of them can reach (v1,off1) with a score <= s_term
+				if (comp) z->n_a = n;
+			}
 		}
 		if (z->opt->i_term > 0 && r->n_iter > z->opt->i_term) break;
 		++z->s;

@@ -51,6 +51,7 @@ static ko_longopt_t long_options[] = {
 	{ "gdp-max-ed",   ko_required_argument, 329 },
 	{ "q-occ-frac",   ko_required_argument, 330 },
 	{ "lc-threads",   ko_required_argument, 331 },
+	{ "gdp-drop",     ko_required_argument, 332 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -170,6 +171,7 @@ int main(int argc, char *argv[])
 		else if (c == 329) opt.gdp_max_ed = mm_parse_num(o.arg); // --gdp-max-ed
 		else if (c == 330) opt.q_occ_frac = atof(o.arg);      // --q-occ-frac
 		else if (c == 331) opt.lc_threads = atoi(o.arg);      // --lc-threads
+		else if (c == 332) opt.gdp_drop = atoi(o.arg);        // --gdp-drop
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -243,6 +245,8 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "                 ignore a query minimizer occurring in >FLOAT of query minimizers [%g]\n", opt.q_occ_frac);
 		fprintf(fp_help, "    --lc-threads INT\n");
 		fprintf(fp_help, "                 threads for chaining and bridging one query sequence; 0 for auto [%d]\n", opt.lc_threads);
+		fprintf(fp_help, "    --gdp-drop INT\n");
+		fprintf(fp_help, "                 compact bridging wavefronts to those that can reach the target, every INT steps; 0 to only stop when none can [%d]\n", opt.gdp_drop);
 		fprintf(fp_help, "    -j FLOAT     expected sequence divergence [%g]\n", opt.div);
 		fprintf(fp_help, "    -g NUM       stop chain enlongation if there are no minimizers in INT-bp [%d]\n", opt.max_gap);
 		fprintf(fp_help, "    -F NUM       max fragment length (effective with -xsr or in the fragment mode) [%d]\n", opt.max_frag_len);

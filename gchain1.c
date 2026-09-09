@@ -348,7 +348,7 @@ static int32_t bridge_shortk(bridge_aux_t *aux, const mg_lchain_t *l0, const mg_
 	return 0;
 }
 
-static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
+static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, int32_t gdp_drop, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
 {
 	uint32_t v0 = l0->v, v1 = l1->v;
 	int32_t qs = l0->qe - kmer_size, qe = l1->qs + kmer_size, end0, end1, j;
@@ -362,7 +362,7 @@ static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max
 
 	gfa_edopt_init(&opt);
 	opt.traceback = 1, opt.max_chk = 1000, opt.bw_dyn = 1000, opt.max_lag = gdp_max_ed/2;
-	opt.i_term = 500000000LL, opt.drop_inf = 4;
+	opt.i_term = 500000000LL, opt.drop_inf = gdp_drop;
 	z = gfa_ed_init(aux->km, &opt, aux->g, aux->es, qe - qs, &aux->qseq[qs], v0, end0);
 	gfa_ed_step(z, v1, end1, gdp_max_ed, &r);
 	gfa_ed_destroy(z);
@@ -386,10 +386,10 @@ static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max
 // segments), shortest-k if that fails. Appends the intermediate vertices to aux->llc. Returns 1 if GWFA found the path
 // (*ed set), 2 if shortest-k did (*ed = -1) and -1 if both failed (nothing appended). It is a pure function of the
 // graph, the query and (l0,l1): it only allocates from aux->km and only writes aux->llc, so it can run on any thread.
-static inline int32_t bridge_search(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
+static inline int32_t bridge_search(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, int32_t gdp_drop, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
 {
 	*ed = -1;
-	if (aux->n_seg <= 1 && bridge_gwfa(aux, kmer_size, gdp_max_ed, l0, l1, ed)) return 1;
+	if (aux->n_seg <= 1 && bridge_gwfa(aux, kmer_size, gdp_max_ed, gdp_drop, l0, l1, ed)) return 1;
 	return bridge_shortk(aux, l0, l1) < 0? -1 : 2;
 }
 
@@ -421,7 +421,7 @@ typedef struct { // one gap lc[st+j0] -> lc[st+j] between different segments
 } bridge_task_t;
 
 typedef struct {
-	int32_t kmer_size, gdp_max_ed;
+	int32_t kmer_size, gdp_max_ed, gdp_drop;
 	const mg_lchain_t *lc;
 	bridge_task_t *task;
 	bridge_aux_t *aux; // one per thread; aux[tid].km is created on first use
@@ -435,7 +435,7 @@ static void bridge_worker(void *data, long k, int tid) // kt_for() callback: one
 	int32_t s, ed;
 	if (aux->km == 0) aux->km = km_init(); // malloc-backed; the caller's arena is not thread-safe
 	aux->n_llc = 0; // here llc is scratch that collects the vertices of this one search
-	t->status = bridge_search(aux, bp->kmer_size, bp->gdp_max_ed, &bp->lc[t->st + t->j0], &bp->lc[t->st + t->j], &ed);
+	t->status = bridge_search(aux, bp->kmer_size, bp->gdp_max_ed, bp->gdp_drop, &bp->lc[t->st + t->j0], &bp->lc[t->st + t->j], &ed);
 	t->ed = ed, t->n_v = aux->n_llc, t->v = 0;
 	if (aux->n_llc > 0) {
 		KMALLOC(aux->km, t->v, aux->n_llc);
@@ -444,7 +444,7 @@ static void bridge_worker(void *data, long k, int tid) // kt_for() callback: one
 }
 
 // res is the recorded Phase B result for this gap, or NULL to search here
-static int32_t bridge_lchains(mg_gchains_t *gc, bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, const mg_lchain_t *l0, const mg_lchain_t *l1, const mg128_t *a, const bridge_task_t *res)
+static int32_t bridge_lchains(mg_gchains_t *gc, bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, int32_t gdp_drop, const mg_lchain_t *l0, const mg_lchain_t *l1, const mg128_t *a, const bridge_task_t *res)
 {
 	if (l1->v != l0->v) { // bridging two segments
 		int32_t ed = -1;
@@ -460,7 +460,7 @@ static int32_t bridge_lchains(mg_gchains_t *gc, bridge_aux_t *aux, int32_t kmer_
 				q->ed = -1;
 			}
 			if (res->status == 1) ed = res->ed;
-		} else if (bridge_search(aux, kmer_size, gdp_max_ed, l0, l1, &ed) < 0) return -1;
+		} else if (bridge_search(aux, kmer_size, gdp_max_ed, gdp_drop, l0, l1, &ed) < 0) return -1;
 		if (aux->n_llc == aux->m_llc) KEXPAND(aux->km, aux->llc, aux->m_llc);
 		copy_lchain(&aux->llc[aux->n_llc++], l1, &aux->n_a, gc->a, a, ed);
 	} else { // on one segment
@@ -526,7 +526,7 @@ static inline uint32_t gchain_hash(uint32_t hash, const mg_lchain_t *lc, int32_t
 // With n_threads > 1 the gaps between different segments are searched in parallel; the result does not depend on n_threads.
 mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_edseq_t *es, int32_t n_u, const uint64_t *u,
 							mg_lchain_t *lc, const mg128_t *a, uint32_t hash, int32_t min_gc_cnt, int32_t min_gc_score,
-							int32_t gdp_max_ed, int32_t n_seg, const char *qseq, int n_threads)
+							int32_t gdp_max_ed, int32_t gdp_drop, int32_t n_seg, const char *qseq, int n_threads)
 {
 	mg_gchains_t *gc;
 	int32_t i, j, k, st, kmer_size, par, n_task = 0, m_task = 0, ti = 0, nt = 0;
@@ -584,7 +584,7 @@ mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_ed
 			for (i = 0; i < nt; ++i)
 				waux[i].g = g, waux[i].es = es, waux[i].n_seg = n_seg, waux[i].qseq = qseq;
 			memset(&bp, 0, sizeof(bp));
-			bp.kmer_size = kmer_size, bp.gdp_max_ed = gdp_max_ed, bp.lc = lc, bp.task = task, bp.aux = waux;
+			bp.kmer_size = kmer_size, bp.gdp_max_ed = gdp_max_ed, bp.gdp_drop = gdp_drop, bp.lc = lc, bp.task = task, bp.aux = waux;
 			if (nt > 1) kt_for(nt, bridge_worker, &bp, n_task);
 			else for (i = 0; i < n_task; ++i) bridge_worker(&bp, i, 0);
 		}
@@ -615,10 +615,10 @@ mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_ed
 					int32_t ret, t;
 					if (ti < n_task && task[ti].st == st && task[ti].j0 == j0 && task[ti].j == j) // the tasks are in walk order
 						res = &task[ti++];
-					ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, l0, l1, a, res);
+					ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, gdp_drop, l0, l1, a, res);
 					if (ret < 0) { // rare: bridge step by step through the cnt==0 lchains, searching here
 						for (t = j0; t < j; ++t) {
-							ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, &lc[st + t], &lc[st + t + 1], a, 0);
+							ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, gdp_drop, &lc[st + t], &lc[st + t + 1], a, 0);
 							assert(ret >= 0);
 						}
 					}
