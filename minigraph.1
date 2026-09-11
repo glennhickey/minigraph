@@ -123,6 +123,32 @@ Regardless of this option, a bridge is abandoned as soon as
 .I every
 live diagonal is infeasible, which cannot change the result.
 .TP
+.B --par-align
+Align the anchor gaps of one query sequence in parallel [off]. Base alignment
+.RB ( -c )
+walks the anchors of every graph chain in order and aligns the gap between
+consecutive anchors with miniwfa; on a chromosome-scale query that is the
+largest serial block left, because the outer parallelism is one task per query
+sequence and a chromosome is one sequence. With this option the gaps that need
+an alignment are collected first, aligned under
+.B -t
+threads, and then replayed into the CIGAR in the original order, so the
+alignment itself is unchanged: the output is byte-identical with the option on
+or off and at any thread count.
+.IP
+It is off by default because it buys wall-clock time with CPU time and a little
+memory. Each worker keeps its own miniwfa working set and its own copy of the
+CIGARs it produced, so the peak is higher, and the shorter queries lose their
+share of the machine to the long one. On a 459-haplotype chr16 build at -t 8
+the alignment stage of the 92.9 Mb contig goes from 99.0 to 55.0 seconds
+(1.80x) and the wall clock from 307 to 264 s, for 24% more CPU seconds and
+0.19 GiB more peak RSS; the 3.2 Mb contig in the same file goes the other way,
+70.5 to 111.2 s, because the fair share by length gives it one thread and it
+now competes with eight busy cores. The thread count is the same
+fair-share-by-length budget the chaining and the bridging use, so
+.B --lc-threads
+applies to this stage too.
+.TP
 .BI -j \ FLOAT
 Expected query-graph sequence divergence [0.1]
 .TP
