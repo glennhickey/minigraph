@@ -16,6 +16,8 @@ void mg_mapopt_init(mg_mapopt_t *mo)
 	mo->seed = 11;
 	mo->occ_max1 = 50, mo->occ_max1_cap = 250;
 	mo->occ_max1_frac = 2e-4f;
+	mo->q_occ_frac = 0.0f;
+	mo->lc_threads = 0;
 	mo->max_gap = 5000;
 	mo->max_gap_ref = -1;
 	mo->max_gap_pre = 1000;
@@ -31,6 +33,8 @@ void mg_mapopt_init(mg_mapopt_t *mo)
 	mo->min_lc_cnt = 5, mo->min_lc_score = 40;
 	mo->min_gc_cnt = 5, mo->min_gc_score = 50;
 	mo->gdp_max_ed = 10000;
+	mo->gdp_drop = 0;
+	mo->par_align = 0;
 	mo->lc_max_trim = 50;
 	mo->lc_max_occ = 2;
 	mo->mask_level = 0.5f;

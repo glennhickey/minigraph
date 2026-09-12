@@ -24,6 +24,7 @@ typedef struct {
 	int *seg_off, *n_seg;
 	mg_gchains_t **gcs;
 	mg_tbuf_t **buf;
+	volatile int64_t rem_len; // total length of the fragments not mapped yet; for intra-sequence parallel chaining
 } step_t;
 
 static void worker_for(void *_data, long i, int tid) // kt_for() callback
@@ -47,6 +48,8 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 	} else {
 		mg_map_frag(s->p->gi, s->n_seg[i], qlens, qseqs, &s->gcs[off], b, s->p->opt, s->seq[off].name);
 	}
+	for (j = 0; j < s->n_seg[i]; ++j)
+		__sync_fetch_and_sub(&s->rem_len, (int64_t)qlens[j]);
 #if 0 // for paired-end reads
 	for (j = 0; j < s->n_seg[i]; ++j) // flip the query strand and coordinate to the original read strand
 		if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori>>1&1)) || (j == 1 && (pe_ori&1)))) {
@@ -82,8 +85,12 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			for (i = 0; i < s->n_seq; ++i)
 				s->seq[i].rid = p->n_processed++;
 			s->buf = (mg_tbuf_t**)calloc(p->n_threads, sizeof(mg_tbuf_t*));
-			for (i = 0; i < p->n_threads; ++i)
+			for (i = 0; i < p->n_threads; ++i) {
 				s->buf[i] = mg_tbuf_init();
+				mg_tbuf_set_par(s->buf[i], p->n_threads, &s->rem_len);
+			}
+			for (i = 0, s->rem_len = 0; i < s->n_seq; ++i)
+				s->rem_len += s->seq[i].l_seq;
 			s->seg_off = (int*)calloc(2 * s->n_seq, sizeof(int));
 			s->n_seg = s->seg_off + s->n_seq; // n_seg, rep_len and frag_gap are allocated together with seg_off
 			KCALLOC(0, s->gcs, s->n_seq);

@@ -29,6 +29,7 @@
 #define MG_M_WRITE_MZ     0x1000000
 #define MG_M_SKIP_GCHECK  0x2000000
 #define MG_M_CIGAR        0x4000000
+#define MG_M_NO_DS        0x8000000
 
 #define MG_G_NONE         0
 #define MG_G_GGSIMPLE     1
@@ -56,6 +57,7 @@ typedef struct {
 	int pe_ori;
 	int occ_max1, occ_max1_cap;
 	float occ_max1_frac;
+	float q_occ_frac;
 	int bw, bw_long;
 	int rmq_size_cap;
 	int rmq_rescue_size;
@@ -66,7 +68,7 @@ typedef struct {
 	int max_lc_skip, max_lc_iter, max_gc_skip;
 	int min_lc_cnt, min_lc_score;
 	int min_gc_cnt, min_gc_score;
-	int gdp_max_ed, lc_max_trim, lc_max_occ;
+	int gdp_max_ed, gdp_drop, par_align, lc_max_trim, lc_max_occ;
 	float mask_level;
 	int sub_diff;
 	int best_n;
@@ -74,6 +76,7 @@ typedef struct {
 	int ref_bonus;
 	int64_t cap_kalloc;
 	int min_cov_mapq, min_cov_blen;
+	int lc_threads; // 0 for auto: # threads for chaining one query sequence
 } mg_mapopt_t;
 
 typedef struct {
@@ -94,6 +97,7 @@ typedef struct {
 	const gfa_t *g;
 	gfa_edseq_t *es;
 	int32_t b, w, k, flag, n_seg;
+	mg64_v occ; // occ.a[c] is the number of distinct minimizers occurring c times
 	struct mg_idx_bucket_s *B; // index (hidden)
 } mg_idx_t;
 
@@ -168,6 +172,7 @@ mg_tbuf_t *mg_tbuf_init(void);
 void mg_tbuf_destroy(mg_tbuf_t *b);
 mg_gchains_t *mg_map(const mg_idx_t *gi, int qlen, const char *seq, mg_tbuf_t *b, const mg_mapopt_t *opt, const char *qname);
 void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **seqs, mg_gchains_t **gcs, mg_tbuf_t *b, const mg_mapopt_t *opt, const char *qname);
+void mg_tbuf_set_par(mg_tbuf_t *b, int n_threads, volatile int64_t *rem_len); // enable intra-sequence parallel chaining
 
 // high-level mapping APIs
 int mg_map_files(gfa_t *g, int n_fn, const char **fn, const mg_idxopt_t *ipt, const mg_mapopt_t *opt0, int n_threads);

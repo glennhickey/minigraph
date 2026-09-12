@@ -68,6 +68,87 @@ it will be the final threshold; otherwise the lower or the upper bound of
 .B -U
 will be applied.
 .TP
+.BI --q-occ-frac \ FLOAT
+Ignore a query minimizer if it occurs in more than
+.I FLOAT
+fraction of all minimizers of the query sequence, and more often than the
+minimizer occurrence threshold (see
+.B -f
+and
+.BR -U )
+[0; disabled]. This filters repeat arrays that are abundant in the query but
+not in the graph, for example a satellite array that the reference represents
+as a run of ambiguous bases. Such minimizers pass the graph-side occurrence
+filter and may generate a very large number of anchors. For chromosome-scale
+queries, 1e-4 is an effective setting; the read-oriented default of 0.01 used
+by minimap2 corresponds to tens of thousands of copies of one k-mer and never
+takes effect at this scale. The option has no effect when a query has fewer
+minimizers than the occurrence threshold, and therefore does not apply to
+short reads.
+.TP
+.BI --lc-threads \ INT
+Number of threads used to chain the anchors of one query sequence and to
+bridge the gaps between its linear chains [0]. Linear chaining is independent
+for each (segment,strand) group of anchors, and bridging is independent for
+each gap, so both can be parallelized within a single query. 0 selects the
+number automatically:
+each query sequence gets its share, by length, of
+.B -t
+out of the query sequences that have not been mapped yet. The result does not
+depend on this option.
+.TP
+.BI --gdp-drop \ INT
+When bridging the gap between two linear chains with GWFA, drop the wavefronts
+that cannot reach the target within the edit-distance limit, testing them every
+.I INT
+steps; 0 disables the dropping, but not the check that stops a bridge when no
+diagonal at all can reach the target, which runs every 16 steps regardless [0].
+A diagonal is dropped only when the
+remaining query is too short, or too long, for it to ever reach the end
+position within the limit, and no descendant of such a diagonal can reach it
+either. 4 is the recommended setting. The cadence does not change which
+diagonals are eventually dropped and 1, 4 and 16 all give the same graph; it
+only trades the cost of the test against the wavefront updates it saves.
+.IP
+Dropping the infeasible diagonals is not output-neutral, which is why it is off
+by default. The bridging band of the GWFA search is anchored on the diagonal
+with the largest anti-diagonal, so removing infeasible diagonals can re-anchor
+the band and let a bridge succeed that used to be pruned to death and fall back
+to the shortest-path search. On a 6-genome yeast build that moves two of 118
+structural-variant calls to strict sub-intervals of the old ones; on a
+459-haplotype chr16 build at -t 8 it takes the bridging stage from 91 to 61
+seconds and leaves the graph byte-identical.
+.IP
+Regardless of this option, a bridge is abandoned as soon as
+.I every
+live diagonal is infeasible, which cannot change the result.
+.TP
+.B --par-align
+Align the anchor gaps of one query sequence in parallel [off]. Base alignment
+.RB ( -c )
+walks the anchors of every graph chain in order and aligns the gap between
+consecutive anchors with miniwfa; on a chromosome-scale query that is the
+largest serial block left, because the outer parallelism is one task per query
+sequence and a chromosome is one sequence. With this option the gaps that need
+an alignment are collected first, aligned under
+.B -t
+threads, and then replayed into the CIGAR in the original order, so the
+alignment itself is unchanged: the output is byte-identical with the option on
+or off and at any thread count.
+.IP
+It is off by default because it buys wall-clock time with CPU time and a little
+memory. Each worker keeps its own miniwfa working set and its own copy of the
+CIGARs it produced, so the peak is higher, and the shorter queries lose their
+share of the machine to the long one. On a 459-haplotype chr16 build at -t 8
+the alignment stage of the 92.9 Mb contig goes from 99.0 to 55.0 seconds
+(1.80x) and the wall clock from 307 to 264 s, for 24% more CPU seconds and
+0.19 GiB more peak RSS; the 3.2 Mb contig in the same file goes the other way,
+70.5 to 111.2 s, because the fair share by length gives it one thread and it
+now competes with eight busy cores. The thread count is the same
+fair-share-by-length budget the chaining and the bridging use, so
+.B --lc-threads
+applies to this stage too.
+.TP
 .BI -j \ FLOAT
 Expected query-graph sequence divergence [0.1]
 .TP

@@ -75,6 +75,7 @@ typedef struct {
 	int32_t bw_dyn, max_lag, max_chk;
 	int32_t s_term;
 	int64_t i_term;
+	int32_t drop_inf; // drop the wavefronts that cannot reach the target, every this many steps; 0 to only stop when all of them are infeasible
 } gfa_edopt_t;
 
 typedef struct {

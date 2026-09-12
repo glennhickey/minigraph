@@ -2,6 +2,7 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
+#include <pthread.h>
 #include "kthread.h"
 #include "kalloc.h"
 #include "sys.h"
@@ -21,11 +22,14 @@ typedef struct {
 	const mg_idx_t *gi;
 	mg_tbuf_t **buf;
 	maprst_t *r;
+	uint64_t *ord; // sequence indices sorted by length in the descending order
+	volatile int64_t rem_len; // total length of the sequences not mapped yet; for intra-sequence parallel chaining
 } step_t;
 
 static void worker_for(void *_data, long i, int tid) // kt_for() callback
 {
     step_t *s = (step_t*)_data;
+	i = (int32_t)s->ord[i];
 	if (mg_dbg_flag & MG_DBG_QNAME)
 		fprintf(stderr, "QR\t%s\t%d\t%d\n", s->r->seq[i].name, tid, s->r->seq[i].l_seq);
 	if ((s->opt->flag & MG_M_SKIP_GCHECK) == 0 && mg_verbose >= 2) {
@@ -34,13 +38,13 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 					__func__, s->r->seq[i].name);
 	}
 	s->r->gcs[i] = mg_map(s->gi, s->r->seq[i].l_seq, s->r->seq[i].seq, s->buf[tid], s->opt, s->r->seq[i].name);
+	__sync_fetch_and_sub(&s->rem_len, (int64_t)s->r->seq[i].l_seq);
 }
 
-static maprst_t *ggen_map(const mg_idx_t *gi, const mg_mapopt_t *opt, const char *fn, int n_threads)
+static maprst_t *ggen_load(const char *fn)
 {
 	mg_bseq_file_t *fp;
 	maprst_t *r;
-	step_t s;
 	int i;
 
 	fp = mg_bseq_open(fn);
@@ -57,17 +61,45 @@ static maprst_t *ggen_map(const mg_idx_t *gi, const mg_mapopt_t *opt, const char
 		mg_toupper(r->seq[i].l_seq, r->seq[i].seq);
 	}
 	KCALLOC(0, r->gcs, r->n_seq);
+	return r;
+}
+
+typedef struct {
+	const char *fn;
+	maprst_t *r;
+} ggen_load_t;
+
+static void *ggen_load_thread(void *data) // for reading the next file while mapping the current one
+{
+	ggen_load_t *p = (ggen_load_t*)data;
+	p->r = ggen_load(p->fn);
+	return 0;
+}
+
+static void ggen_map(const mg_idx_t *gi, const mg_mapopt_t *opt, maprst_t *r, int n_threads)
+{
+	step_t s;
+	int i;
 
 	s.gi = gi, s.opt = opt, s.r = r;
+	KMALLOC(0, s.ord, r->n_seq);
+	for (i = 0, s.rem_len = 0; i < r->n_seq; ++i) { // map long sequences first for better load balancing
+		s.ord[i] = (uint64_t)(INT32_MAX - r->seq[i].l_seq) << 32 | i;
+		s.rem_len += r->seq[i].l_seq;
+	}
+	radix_sort_gfa64(s.ord, s.ord + r->n_seq);
 	KCALLOC(0, s.buf, n_threads);
-	for (i = 0; i < n_threads; ++i) s.buf[i] = mg_tbuf_init();
+	for (i = 0; i < n_threads; ++i) {
+		s.buf[i] = mg_tbuf_init();
+		mg_tbuf_set_par(s.buf[i], n_threads, &s.rem_len);
+	}
 	kt_for(n_threads, worker_for, &s, r->n_seq);
+	free(s.ord);
 	if (mg_verbose >= 3)
 		fprintf(stderr, "[M::%s::%.3f*%.2f] mapped %d sequence(s) to the graph\n", __func__,
 				realtime() - mg_realtime0, cputime() / (realtime() - mg_realtime0), r->n_seq);
 	for (i = 0; i < n_threads; ++i) mg_tbuf_destroy(s.buf[i]);
 	free(s.buf);
-	return r;
 }
 
 static void mg_free_maprst(maprst_t *r)
@@ -85,12 +117,24 @@ int mg_ggen_aug(gfa_t *g, int32_t n_fn, const char **fn, const mg_idxopt_t *ipt,
 {
 	int i;
 	mg_mapopt_t opt = *opt0;
+	ggen_load_t ld;
+	pthread_t tid;
 	if (g == 0) return -1;
+	if (n_fn <= 0) return 0;
+	opt.flag |= MG_M_NO_DS; // the ds tag is only used for GAF output
+	ld.fn = fn[0];
+	pthread_create(&tid, 0, ggen_load_thread, &ld);
 	for (i = 0; i < n_fn; ++i) {
 		mg_idx_t *gi;
 		maprst_t *r;
 		if ((gi = mg_index(g, ipt, n_threads, &opt)) == 0) return -1;
-		r = ggen_map(gi, &opt, fn[i], n_threads);
+		pthread_join(tid, 0);
+		if ((r = ld.r) == 0) return -1;
+		if (i + 1 < n_fn) {
+			ld.fn = fn[i+1];
+			pthread_create(&tid, 0, ggen_load_thread, &ld);
+		}
+		ggen_map(gi, &opt, r, n_threads);
 		if (opt0->flag & MG_M_CIGAR)
 			mg_ggsimple_cigar(0, go, g, r->n_seq, r->seq, r->gcs);
 		else
@@ -113,7 +157,8 @@ int mg_ggen_cov(gfa_t *g, int32_t n_fn, const char **fn, const mg_idxopt_t *ipt,
 	KCALLOC(0, cov_link, g->n_arc);
 	for (i = 0; i < n_fn; ++i) {
 		maprst_t *r;
-		r = ggen_map(gi, &opt, fn[i], n_threads);
+		if ((r = ggen_load(fn[i])) == 0) return -1;
+		ggen_map(gi, &opt, r, n_threads);
 		mg_cov_asm(g, r->n_seq, r->gcs, go->min_mapq, go->min_map_len, cov_seg, cov_link);
 		mg_free_maprst(r);
 	}
@@ -131,7 +176,8 @@ int mg_ggen_call(gfa_t *g, const char *fn, const mg_idxopt_t *ipt, const mg_mapo
 	mg_idx_t *gi;
 	maprst_t *r;
 	if ((gi = mg_index(g, ipt, n_threads, &opt)) == 0) return -1;
-	r = ggen_map(gi, &opt, fn, n_threads);
+	if ((r = ggen_load(fn)) == 0) return -1;
+	ggen_map(gi, &opt, r, n_threads);
 	mg_call_asm(g, r->n_seq, r->seq, r->gcs, go->min_mapq, go->min_map_len);
 	mg_free_maprst(r);
 	mg_idx_destroy(gi);

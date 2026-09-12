@@ -7,6 +7,7 @@
 #include "khashl.h" // make it compatible with kalloc
 #include "kdq.h"
 #include "kvec-km.h"
+#include "kthread.h"
 
 int gfa_ed_dbg = 0;
 
@@ -21,24 +22,34 @@ void gfa_edopt_init(gfa_edopt_t *opt)
 	opt->max_chk = 1000;
 }
 
-gfa_edseq_t *gfa_edseq_init(const gfa_t *g)
-{
-	uint32_t i, n_vtx = gfa_n_vtx(g);
+typedef struct {
+	const gfa_t *g;
 	gfa_edseq_t *es;
-	GFA_MALLOC(es, n_vtx);
-	for (i = 0; i < g->n_seg; ++i) {
-		const gfa_seg_t *s = &g->seg[i];
-		char *t;
-		int32_t j;
-		GFA_MALLOC(t, s->len + 1);
-		for (j = 0; j < s->len; ++j)
-			t[s->len - j - 1] = gfa_comp_table[(uint8_t)s->seq[j]];
-		t[s->len] = 0;
-		es[i<<1].seq = (char*)s->seq;
-		es[i<<1|1].seq = t;
-		es[i<<1].len = es[i<<1|1].len = s->len;
-	}
-	return es;
+} edseq_aux_t;
+
+static void worker_edseq(void *data, long i, int tid)
+{
+	edseq_aux_t *d = (edseq_aux_t*)data;
+	const gfa_seg_t *s = &d->g->seg[i];
+	gfa_edseq_t *es = d->es;
+	char *t;
+	int32_t j;
+	GFA_MALLOC(t, s->len + 1);
+	for (j = 0; j < s->len; ++j)
+		t[s->len - j - 1] = gfa_comp_table[(uint8_t)s->seq[j]];
+	t[s->len] = 0;
+	es[i<<1].seq = (char*)s->seq;
+	es[i<<1|1].seq = t;
+	es[i<<1].len = es[i<<1|1].len = s->len;
+}
+
+gfa_edseq_t *gfa_edseq_init(const gfa_t *g, int n_threads)
+{
+	edseq_aux_t d;
+	d.g = g;
+	GFA_MALLOC(d.es, gfa_n_vtx(g));
+	kt_for(n_threads, worker_edseq, &d, g->n_seg);
+	return d.es;
 }
 
 void gfa_edseq_destroy(int32_t n_seg, gfa_edseq_t *es)
@@ -259,7 +270,103 @@ typedef struct {
 	gwf_intv_v tmp, swap;
 	gwf_diag_v ooo;
 	gwf_trace_v t;
+	gwf_map64_t *he; // vertex -> min number of target bases from the end of the vertex to (he_v1,he_off1); see gwf_build_he()
+	uint32_t he_v1;
+	int32_t he_off1, he_radius, he_full;
 } gwf_edbuf_t;
+
+/*
+ * Detecting - and optionally dropping - the wavefronts that cannot reach the target
+ */
+#define GWF_HE_MAX_POP 100000
+
+#define gwf_heap_lt(a, b) ((a) > (b)) // min-heap
+KSORT_INIT(gwf_heap, uint64_t, gwf_heap_lt)
+
+typedef kvec_t(uint64_t) gwf_u64_v;
+
+static inline void gwf_heap_push(void *km, gwf_u64_v *h, int64_t e, uint32_t v)
+{
+	kv_push(uint64_t, km, *h, (uint64_t)e<<32 | v);
+	ks_heapup_gwf_heap(h->n, h->a);
+}
+
+// For each vertex v within $radius target bases of (v1,off1), compute the min number of target bases consumed after the end of v to
+// reach (v1,off1). This is Dijkstra from v1 on the reverse graph: arc (v^1 -> x) is the complement of (x^1 -> v).
+static void gwf_build_he(gwf_edbuf_t *buf, const gfa_t *g, uint32_t v1, int32_t off1, int32_t radius)
+{
+	int32_t j, nv, n_pop = 0;
+	gwf_u64_v heap = {0,0,0};
+	const gfa_arc_t *av;
+	gwf_map64_destroy(buf->he);
+	buf->he = gwf_map64_init2(buf->km);
+	buf->he_v1 = v1, buf->he_off1 = off1, buf->he_radius = radius, buf->he_full = 1;
+	nv = gfa_arc_n(g, v1^1), av = gfa_arc_a(g, v1^1);
+	for (j = 0; j < nv; ++j) { // a predecessor of v1 enters v1 at position ov and reaches off1 after off1-ov+1 bases
+		int32_t e = off1 + 1 - av[j].ov;
+		if (e > 0 && e <= radius) gwf_heap_push(buf->km, &heap, e, av[j].w^1);
+	}
+	while (heap.n > 0) {
+		uint64_t x = heap.a[0];
+		uint32_t v = (uint32_t)x;
+		int32_t e = x>>32;
+		khint_t k;
+		int absent;
+		heap.a[0] = heap.a[--heap.n];
+		if (heap.n > 0) ks_heapdown_gwf_heap(0, heap.n, heap.a);
+		k = gwf_map64_put(buf->he, v, &absent);
+		if (!absent) continue; // already finalized with a smaller distance
+		kh_val(buf->he, k) = e;
+		if (++n_pop > GWF_HE_MAX_POP) { // too many vertices; leave the rest unknown
+			buf->he_full = 0;
+			break;
+		}
+		nv = gfa_arc_n(g, v^1), av = gfa_arc_a(g, v^1);
+		for (j = 0; j < nv; ++j) {
+			int64_t c = (int64_t)e + g->seg[v>>1].len - av[j].ov;
+			if (c <= radius && gwf_map64_get(buf->he, av[j].w^1) == kh_end(buf->he))
+				gwf_heap_push(buf->km, &heap, c, av[j].w^1);
+		}
+	}
+	kfree(buf->km, heap.a);
+}
+
+// Test every diagonal in a[] (all at score $s) for whether it can still reach (v1,off1) at the end of the query with a score
+// <= $s_term. A diagonal (v,d,k) has R=ql-1-(d+k) query bases left and needs at least $rem more target bases, so its final
+// score is >= s + max(0, rem - R). No transition lowers rem-R by more than it raises the score, so every descendant of an
+// infeasible diagonal fails the same test: no path reaching (v1,off1) with a score <= $s_term goes through one.
+// With $compact, a[] is compacted down to the feasible diagonals - it stays sorted by vd, as the callers require - and their
+// number is returned. Without it, a[] is left untouched and the scan stops at the first feasible diagonal, returning a
+// positive number. Either way a zero return means the whole wavefront is hopeless and the search can stop.
+static int32_t gwf_drop_infeasible(gwf_edbuf_t *buf, const gfa_t *g, const gfa_edseq_t *es, int32_t n_a, gwf_diag_t *a, int32_t ql, uint32_t v1, int32_t off1, int32_t s, int32_t s_term, int32_t compact)
+{
+	int32_t i, j, budget = s_term - s;
+	int64_t radius = (int64_t)ql + s_term, E = -1;
+	uint32_t last_v = (uint32_t)-1;
+	if (radius > INT32_MAX) radius = INT32_MAX;
+	if (buf->he == 0 || buf->he_v1 != v1 || buf->he_off1 != off1 || buf->he_radius != radius)
+		gwf_build_he(buf, g, v1, off1, radius);
+	if (compact && !buf->he_full) return n_a; // the E map is incomplete due to GWF_HE_MAX_POP; keep everything
+	for (i = j = 0; i < n_a; ++i) {
+		uint32_t v = a[i].vd>>32;
+		int32_t k = a[i].k, d = (int32_t)a[i].vd - GWF_DIAG_SHIFT;
+		int64_t R = (int64_t)ql - 1 - (d + k), rem;
+		if (v != last_v) {
+			khint_t h = gwf_map64_get(buf->he, v);
+			if (h != kh_end(buf->he)) E = kh_val(buf->he, h);
+			else if (buf->he_full) E = -1; // (v1,off1) is not reachable from the end of v within the radius
+			else return n_a; // unknown due to GWF_HE_MAX_POP; keep everything
+			last_v = v;
+		}
+		if (v == v1 && k <= off1) rem = off1 - k;
+		else rem = E < 0? -1 : E + (es[v].len - 1 - k);
+		if (rem >= 0 && rem - R <= budget) {
+			if (!compact) return n_a; // feasible, so the wavefront is not hopeless; a[] must not be touched
+			a[j++] = a[i];
+		}
+	}
+	return compact? j : 0;
+}
 
 // remove diagonals not on the wavefront
 static int32_t gwf_dedup(gwf_edbuf_t *buf, int32_t n_a, gwf_diag_t *a)
@@ -579,6 +686,16 @@ void gfa_ed_step(void *z_, uint32_t v1, int32_t off1, int32_t s_term, gfa_edrst_
 		if (r->end_off >= 0 || z->n_a == 0) break;
 		if (r->n_end > 0) break;
 		if (s_term >= 0 && z->s >= s_term) break;
+		if (s_term >= 0 && v1 != (uint32_t)-1) { // the diagonals in z->a are at score z->s+1
+			// The all-infeasible abort runs every 16 steps whatever drop_inf is, so setting the option cannot take it away;
+			// drop_inf only adds the compaction, on its own multiples.
+			int32_t comp = opt->drop_inf > 0 && (z->s + 1) % opt->drop_inf == 0;
+			if (comp || (z->s + 1) % 16 == 0) {
+				int32_t n = gwf_drop_infeasible(&z->buf, z->g, z->es, z->n_a, z->a, z->ql, v1, off1, z->s + 1, s_term, comp);
+				if (n == 0) break; // none of them can reach (v1,off1) with a score <= s_term
+				if (comp) z->n_a = n;
+			}
+		}
 		if (z->opt->i_term > 0 && r->n_iter > z->opt->i_term) break;
 		++z->s;
 		if (gfa_ed_dbg >= 1) {
@@ -599,6 +716,7 @@ void gfa_ed_destroy(void *z_)
 	kfree(km, z->a);
 	gwf_set64_destroy(z->buf.ha);
 	gwf_map64_destroy(z->buf.ht);
+	gwf_map64_destroy(z->buf.he);
 	kfree(km, z->buf.ooo.a);
 	kfree(km, z->buf.intv.a);
 	kfree(km, z->buf.tmp.a);

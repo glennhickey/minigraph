@@ -86,7 +86,7 @@ uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f, const int64_
 mg128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int max_iter, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
 					  int is_cdna, int n_seg, int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km);
 mg128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_skip, int cap_rmq_size, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
-					   int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km);
+					   int64_t n, mg128_t *a, int *n_u_, uint64_t **_u, void *km, int n_threads);
 mg_lchain_t *mg_lchain_gen(void *km, uint32_t hash, int qlen, int n_u, uint64_t *u, mg128_t *a);
 void mg_update_anchors(int32_t n_a, mg128_t *a, int32_t n, const int32_t *mini_pos);
 
@@ -95,8 +95,8 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, const mg128_t *an, uint64_t **u_);
 mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_edseq_t *es, int32_t n_u, const uint64_t *u,
 							mg_lchain_t *lc, const mg128_t *a, uint32_t hash, int32_t min_gc_cnt, int32_t min_gc_score,
-							int32_t gdp_max_ed, int32_t n_seg, const char *qseq);
-void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt, const char *qname);
+							int32_t gdp_max_ed, int32_t gdp_drop, int32_t n_seg, const char *qseq, int n_threads);
+void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt, const char *qname, int n_threads);
 void mg_gchain_gen_ds(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt);
 void mg_gchain_free(mg_gchains_t *gs);
 

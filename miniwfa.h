@@ -39,6 +39,7 @@ typedef struct {
 	int32_t step;     // distance between checkpoints in the low-memory mode
 	int32_t max_s;    // stop the alignment if score is higher than this
 	int64_t max_iter;
+	int64_t sub_iter; // in mwf_wfa_chain(), try the standard mode up to this many cells before the low-memory mode
 	// chaining heuristics
 	int32_t max_occ, kmer, min_len;
 } mwf_opt_t;

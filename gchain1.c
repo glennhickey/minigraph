@@ -4,6 +4,8 @@
 #include "ksort.h" // for radix sort
 #include "khashl.h" // for kh_hash_uint32()
 #include "gfa-priv.h"
+#include "kalloc.h"
+#include "kthread.h"
 
 typedef struct {
 	uint32_t srt;
@@ -346,7 +348,7 @@ static int32_t bridge_shortk(bridge_aux_t *aux, const mg_lchain_t *l0, const mg_
 	return 0;
 }
 
-static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
+static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, int32_t gdp_drop, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
 {
 	uint32_t v0 = l0->v, v1 = l1->v;
 	int32_t qs = l0->qe - kmer_size, qe = l1->qs + kmer_size, end0, end1, j;
@@ -360,7 +362,7 @@ static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max
 
 	gfa_edopt_init(&opt);
 	opt.traceback = 1, opt.max_chk = 1000, opt.bw_dyn = 1000, opt.max_lag = gdp_max_ed/2;
-	opt.i_term = 500000000LL;
+	opt.i_term = 500000000LL, opt.drop_inf = gdp_drop;
 	z = gfa_ed_init(aux->km, &opt, aux->g, aux->es, qe - qs, &aux->qseq[qs], v0, end0);
 	gfa_ed_step(z, v1, end1, gdp_max_ed, &r);
 	gfa_ed_destroy(z);
@@ -380,13 +382,85 @@ static int32_t bridge_gwfa(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max
 	return 1;
 }
 
-static int32_t bridge_lchains(mg_gchains_t *gc, bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, const mg_lchain_t *l0, const mg_lchain_t *l1, const mg128_t *a)
+// The search half of bridge_lchains() for two lchains on different segments: GWFA first (unless the query has several
+// segments), shortest-k if that fails. Appends the intermediate vertices to aux->llc. Returns 1 if GWFA found the path
+// (*ed set), 2 if shortest-k did (*ed = -1) and -1 if both failed (nothing appended). It is a pure function of the
+// graph, the query and (l0,l1): it only allocates from aux->km and only writes aux->llc, so it can run on any thread.
+static inline int32_t bridge_search(bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, int32_t gdp_drop, const mg_lchain_t *l0, const mg_lchain_t *l1, int32_t *ed)
+{
+	*ed = -1;
+	if (aux->n_seg <= 1 && bridge_gwfa(aux, kmer_size, gdp_max_ed, gdp_drop, l0, l1, ed)) return 1;
+	return bridge_shortk(aux, l0, l1) < 0? -1 : 2;
+}
+
+/*****************************************************************************
+ * Bridging the gaps of one query in parallel
+ *
+ * mg_gchain_gen() bridges consecutive lchains l0 -> l1 of a gchain in order,
+ * and the expensive part - bridge_search() above - depends only on l0 and l1
+ * *after* resolve_overlap() has trimmed them, not on anything the loop has
+ * done for earlier gaps: the shared llc, gc->a and the anchor counter are only
+ * written by copy_lchain(), and the same-segment case never searches. So the
+ * gaps of a query can be searched by kt_for(): first resolve_overlap() is run
+ * for every qualifying gchain (Phase A, serial - it mutates lc[]), then every
+ * gap between two different segments is searched into a private per-thread
+ * arena (Phase B), and finally the original loop runs unchanged except that
+ * bridge_lchains() replays a recorded result instead of searching (Phase C).
+ * The recorded vertices are in the order the serial code appends them, so
+ * the GFA is byte-identical whatever the thread count. Only the stderr
+ * warnings of bridge_shortk() may come out in a different order.
+ *****************************************************************************/
+
+#define MG_BRIDGE_PAR_MIN_TASK 16 // don't start threads for fewer gaps than this
+
+typedef struct { // one gap lc[st+j0] -> lc[st+j] between different segments
+	int32_t st, j0, j;
+	int32_t status;  // 1: GWFA found the path; 2: shortest-k did; -1: both failed
+	int32_t ed, n_v; // GWFA edit distance (-1 unless status==1) and the intermediate vertices
+	uint32_t *v;     // allocated from the worker's arena
+} bridge_task_t;
+
+typedef struct {
+	int32_t kmer_size, gdp_max_ed, gdp_drop;
+	const mg_lchain_t *lc;
+	bridge_task_t *task;
+	bridge_aux_t *aux; // one per thread; aux[tid].km is created on first use
+} bridge_par_t;
+
+static void bridge_worker(void *data, long k, int tid) // kt_for() callback: one gap per call
+{
+	bridge_par_t *bp = (bridge_par_t*)data;
+	bridge_aux_t *aux = &bp->aux[tid];
+	bridge_task_t *t = &bp->task[k];
+	int32_t s, ed;
+	if (aux->km == 0) aux->km = km_init(); // malloc-backed; the caller's arena is not thread-safe
+	aux->n_llc = 0; // here llc is scratch that collects the vertices of this one search
+	t->status = bridge_search(aux, bp->kmer_size, bp->gdp_max_ed, bp->gdp_drop, &bp->lc[t->st + t->j0], &bp->lc[t->st + t->j], &ed);
+	t->ed = ed, t->n_v = aux->n_llc, t->v = 0;
+	if (aux->n_llc > 0) {
+		KMALLOC(aux->km, t->v, aux->n_llc);
+		for (s = 0; s < aux->n_llc; ++s) t->v[s] = aux->llc[s].v;
+	}
+}
+
+// res is the recorded Phase B result for this gap, or NULL to search here
+static int32_t bridge_lchains(mg_gchains_t *gc, bridge_aux_t *aux, int32_t kmer_size, int32_t gdp_max_ed, int32_t gdp_drop, const mg_lchain_t *l0, const mg_lchain_t *l1, const mg128_t *a, const bridge_task_t *res)
 {
 	if (l1->v != l0->v) { // bridging two segments
-		int32_t ed = -1, ret = 0;
-		if (aux->n_seg > 1 || !bridge_gwfa(aux, kmer_size, gdp_max_ed, l0, l1, &ed))
-			ret = bridge_shortk(aux, l0, l1);
-		if (ret < 0) return -1;
+		int32_t ed = -1;
+		if (res) { // replay the result of the parallel search
+			int32_t s;
+			if (res->status < 0) return -1;
+			for (s = 0; s < res->n_v; ++s) {
+				mg_llchain_t *q;
+				if (aux->n_llc == aux->m_llc) KEXPAND(aux->km, aux->llc, aux->m_llc);
+				q = &aux->llc[aux->n_llc++];
+				q->off = q->cnt = q->score = 0;
+				q->v = res->v[s];
+				q->ed = -1;
+			}
+			if (res->status == 1) ed = res->ed;
+		} else if (bridge_search(aux, kmer_size, gdp_max_ed, gdp_drop, l0, l1, &ed) < 0) return -1;
 		if (aux->n_llc == aux->m_llc) KEXPAND(aux->km, aux->llc, aux->m_llc);
 		copy_lchain(&aux->llc[aux->n_llc++], l1, &aux->n_a, gc->a, a, ed);
 	} else { // on one segment
@@ -440,59 +514,111 @@ static void resolve_overlap(mg_lchain_t *l0, mg_lchain_t *l1, const mg128_t *a)
 	if (l0->cnt == 0) l0->qs = l0->qe = l1->qs, l0->rs = l0->re = l1->rs; // this line should have no effect
 }
 
+// hash of a gchain, computed before resolve_overlap() trims its lchains
+static inline uint32_t gchain_hash(uint32_t hash, const mg_lchain_t *lc, int32_t n)
+{
+	int32_t j;
+	for (j = 0; j < n; ++j)
+		hash += kh_hash_uint32(lc[j].qs) + kh_hash_uint32(lc[j].re) + kh_hash_uint32(lc[j].v);
+	return kh_hash_uint32(hash);
+}
+
+// With n_threads > 1 the gaps between different segments are searched in parallel; the result does not depend on n_threads.
 mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_edseq_t *es, int32_t n_u, const uint64_t *u,
 							mg_lchain_t *lc, const mg128_t *a, uint32_t hash, int32_t min_gc_cnt, int32_t min_gc_score,
-							int32_t gdp_max_ed, int32_t n_seg, const char *qseq)
+							int32_t gdp_max_ed, int32_t gdp_drop, int32_t n_seg, const char *qseq, int n_threads)
 {
 	mg_gchains_t *gc;
-	int32_t i, j, k, st, kmer_size;
-	bridge_aux_t aux;
+	int32_t i, j, k, st, kmer_size, par, n_task = 0, m_task = 0, ti = 0, nt = 0;
+	bridge_aux_t aux, *waux = 0;
+	bridge_task_t *task = 0;
+	uint8_t *keep = 0; // keep[i]: gchain i passes the filters, decided on the anchor counts BEFORE resolve_overlap()
 
 	// preallocate gc->gc and gc->a
 	KCALLOC(km_dst, gc, 1);
+	if (n_u > 0) KCALLOC(km, keep, n_u);
 	for (i = 0, st = 0; i < n_u; ++i) {
 		int32_t m = 0, nui = (int32_t)u[i];
 		for (j = 0; j < nui; ++j) m += lc[st + j].cnt; // m is the number of anchors in this gchain
-		if (m >= min_gc_cnt && u[i]>>32 >= min_gc_score)
-			gc->n_gc++, gc->n_a += m;
+		keep[i] = (m >= min_gc_cnt && u[i]>>32 >= min_gc_score);
+		if (keep[i]) gc->n_gc++, gc->n_a += m;
 		st += nui;
 	}
-	if (gc->n_gc == 0) return gc;
+	if (gc->n_gc == 0) { kfree(km, keep); return gc; }
 	gc->km = km_dst;
 	KCALLOC(km_dst, gc->gc, gc->n_gc);
 	KMALLOC(km_dst, gc->a, gc->n_a);
+	kmer_size = a[0].y>>32&0xff;
 
-	// core loop
+	par = (n_threads > 1);
+	if (par) {
+		// Phase A: hash and resolve_overlap() every qualifying gchain, then list the gaps between different segments
+		// exactly as the core loop below will walk them
+		for (i = k = 0, st = 0; i < n_u; ++i) {
+			int32_t nui = (int32_t)u[i];
+			if (keep[i]) {
+				int32_t j0;
+				gc->gc[k].hash = gchain_hash(hash, &lc[st], nui);
+				for (j = 1; j < nui; ++j)
+					resolve_overlap(&lc[st + j - 1], &lc[st + j], a);
+				for (j0 = 0, j = 1; j < nui; ++j) {
+					if (lc[st + j].cnt > 0) {
+						if (lc[st + j].v != lc[st + j0].v) {
+							if (n_task == m_task) KEXPAND(km, task, m_task);
+							task[n_task].st = st, task[n_task].j0 = j0, task[n_task].j = j;
+							++n_task;
+						}
+						j0 = j;
+					}
+				}
+				++k;
+			}
+			st += nui;
+		}
+		// Phase B: search the gaps, each thread into its own arena
+		if (n_task > 0) {
+			bridge_par_t bp;
+			nt = n_task >= MG_BRIDGE_PAR_MIN_TASK? n_threads : 1;
+			if (nt > n_task) nt = n_task;
+			KCALLOC(km, waux, nt);
+			for (i = 0; i < nt; ++i)
+				waux[i].g = g, waux[i].es = es, waux[i].n_seg = n_seg, waux[i].qseq = qseq;
+			memset(&bp, 0, sizeof(bp));
+			bp.kmer_size = kmer_size, bp.gdp_max_ed = gdp_max_ed, bp.gdp_drop = gdp_drop, bp.lc = lc, bp.task = task, bp.aux = waux;
+			if (nt > 1) kt_for(nt, bridge_worker, &bp, n_task);
+			else for (i = 0; i < n_task; ++i) bridge_worker(&bp, i, 0);
+		}
+		if (mg_dbg_flag & MG_DBG_LC_PROF) fprintf(stderr, "BP\tn_gap=%d\tnt=%d\n", n_task, nt);
+	}
+
+	// core loop (Phase C when par)
 	memset(&aux, 0, sizeof(aux));
 	aux.km = km, aux.g = g, aux.es = es, aux.n_seg = n_seg, aux.qseq = qseq;
-	kmer_size = a[0].y>>32&0xff;
 	for (i = k = 0, st = 0, aux.n_a = 0; i < n_u; ++i) {
-		int32_t n_a0 = aux.n_a, n_llc0 = aux.n_llc, m = 0, nui = (int32_t)u[i];
-		for (j = 0; j < nui; ++j) m += lc[st + j].cnt;
-		if (m >= min_gc_cnt && u[i]>>32 >= min_gc_score) {
-			uint32_t h = hash;
+		int32_t n_a0 = aux.n_a, n_llc0 = aux.n_llc, nui = (int32_t)u[i];
+		if (keep[i]) {
 			int32_t j0;
 			gc->gc[k].score = u[i]>>32;
 			gc->gc[k].off = n_llc0;
-			for (j = 0; j < nui; ++j) {
-				const mg_lchain_t *p = &lc[st + j];
-				h += kh_hash_uint32(p->qs) + kh_hash_uint32(p->re) + kh_hash_uint32(p->v);
+			if (!par) { // otherwise done in Phase A
+				gc->gc[k].hash = gchain_hash(hash, &lc[st], nui);
+				for (j = 1; j < nui; ++j)
+					resolve_overlap(&lc[st + j - 1], &lc[st + j], a);
 			}
-			gc->gc[k].hash = kh_hash_uint32(h);
-
-			for (j = 1; j < nui; ++j)
-				resolve_overlap(&lc[st + j - 1], &lc[st + j], a);
 
 			if (aux.n_llc == aux.m_llc) KEXPAND(aux.km, aux.llc, aux.m_llc);
 			copy_lchain(&aux.llc[aux.n_llc++], &lc[st], &aux.n_a, gc->a, a, -1); // copy the first lchain
 			for (j0 = 0, j = 1; j < nui; ++j) {
 				const mg_lchain_t *l0 = &lc[st + j0], *l1 = &lc[st + j];
 				if (l1->cnt > 0) {
+					const bridge_task_t *res = 0;
 					int32_t ret, t;
-					ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, l0, l1, a);
-					if (ret < 0) {
+					if (ti < n_task && task[ti].st == st && task[ti].j0 == j0 && task[ti].j == j) // the tasks are in walk order
+						res = &task[ti++];
+					ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, gdp_drop, l0, l1, a, res);
+					if (ret < 0) { // rare: bridge step by step through the cnt==0 lchains, searching here
 						for (t = j0; t < j; ++t) {
-							ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, &lc[st + t], &lc[st + t + 1], a);
+							ret = bridge_lchains(gc, &aux, kmer_size, gdp_max_ed, gdp_drop, &lc[st + t], &lc[st + t + 1], a, 0);
 							assert(ret >= 0);
 						}
 					}
@@ -507,6 +633,12 @@ mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_ed
 		st += nui;
 	}
 	assert(aux.n_a <= gc->n_a);
+	assert(ti == n_task);
+	for (i = 0; i < nt; ++i) // the recorded results live in the worker arenas
+		if (waux[i].km) km_destroy(waux[i].km);
+	kfree(km, waux);
+	kfree(km, task);
+	kfree(km, keep);
 
 	gc->n_a = aux.n_a;
 	gc->n_lc = aux.n_llc;

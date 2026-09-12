@@ -9,6 +9,8 @@
 struct mg_tbuf_s {
 	void *km;
 	int frag_gap;
+	int n_threads;             // thread budget of the enclosing kt_for(), for intra-sequence parallelism
+	volatile int64_t *rem_len; // total length of the query sequences not finished yet; shared by all buffers
 };
 
 mg_tbuf_t *mg_tbuf_init(void)
@@ -31,6 +33,38 @@ void *mg_tbuf_get_km(mg_tbuf_t *b)
 	return b->km;
 }
 
+void mg_tbuf_set_par(mg_tbuf_t *b, int n_threads, volatile int64_t *rem_len)
+{
+	b->n_threads = n_threads, b->rem_len = rem_len;
+}
+
+#define MG_LC_PAR_MIN_A 50000 // don't thread the chaining of a query with fewer anchors than this
+
+// Number of threads to give to one stage of one query sequence. kt_for() has one task per
+// query sequence, so with few and very unequal sequences - 1-5 per file for per-chromosome
+// minigraph-cactus jobs - most threads sit idle. Give this sequence its share of the thread
+// budget by length, out of the sequences that have not finished yet; when it is the only one
+// left (or dominates the remaining work) it gets the whole budget.
+static int mg_par_threads(const mg_tbuf_t *b, const mg_mapopt_t *opt, int64_t qlen)
+{
+	int64_t rem, n;
+	if (opt->lc_threads > 0) return opt->lc_threads; // explicitly set with --lc-threads
+	if (b->n_threads <= 1 || b->rem_len == 0 || qlen <= 0) return 1;
+	rem = *b->rem_len;
+	if (rem <= qlen) return b->n_threads;
+	n = ((int64_t)b->n_threads * qlen + rem - 1) / rem; // ceil of the fair share
+	if (n < 1) n = 1;
+	if (n > b->n_threads) n = b->n_threads;
+	return (int)n;
+}
+
+// threads for the linear chaining of one query; a query with few anchors is not worth threading
+static int mg_lc_threads(const mg_tbuf_t *b, const mg_mapopt_t *opt, int64_t qlen, int64_t n_a)
+{
+	if (opt->lc_threads <= 0 && n_a < MG_LC_PAR_MIN_A) return 1;
+	return mg_par_threads(b, opt, qlen);
+}
+
 static void collect_minimizers(void *km, const mg_mapopt_t *opt, const mg_idx_t *gi, int n_segs, const int *qlens, const char **seqs, mg128_v *mv)
 {
 	int i, n, sum = 0;
@@ -42,6 +76,35 @@ static void collect_minimizers(void *km, const mg_mapopt_t *opt, const mg_idx_t 
 			mv->a[j].y += sum << 1;
 		sum += qlens[i], n = mv->n;
 	}
+}
+
+// Flag on a minimizer in mg128_v::y. Bits 32-39 hold the segment ID (at most MG_MAX_SEG), so bit 40 is free.
+#define MG_MINI_FLT (1ULL<<40)
+
+// Flag query minimizers that are highly repetitive in the query itself. Such a minimizer may still be rare in the
+// graph - e.g. a satellite array present in the query but masked with N in the reference - and would then pass the
+// occurrence filter in collect_matches() and generate a huge number of anchors. Cf. mm_seed_mz_flt() in minimap2;
+// unlike minimap2 we keep the minimizers and let collect_matches() treat them as repetitive, so that they still
+// count towards rep_len and thus towards mapping quality.
+static void mm_seed_mz_flt(void *km, mg128_v *mv, int32_t q_occ_max, float q_occ_frac)
+{
+	mg128_t *a;
+	size_t i, j, st;
+	if (mv->n <= (size_t)q_occ_max || q_occ_frac <= 0.0f || q_occ_max <= 0) return;
+	KMALLOC(km, a, mv->n);
+	for (i = 0; i < mv->n; ++i)
+		a[i].x = mv->a[i].x>>8, a[i].y = i; // the lowest 8 bits of x keep the k-mer span; collect_matches() keys on x>>8
+	radix_sort_128x(a, a + mv->n);
+	for (st = 0, i = 1; i <= mv->n; ++i) {
+		if (i == mv->n || a[i].x != a[st].x) {
+			int64_t cnt = i - st;
+			if (cnt > q_occ_max && cnt > mv->n * q_occ_frac)
+				for (j = st; j < i; ++j)
+					mv->a[a[j].y].y |= MG_MINI_FLT;
+			st = i;
+		}
+	}
+	kfree(km, a);
 }
 
 #include "ksort.h"
@@ -64,11 +127,11 @@ static mg_match_t *collect_matches(void *km, int *_n_m, int max_occ, const mg_id
 	KMALLOC(km, *mini_pos, mv->n);
 	m = (mg_match_t*)kmalloc(km, mv->n * sizeof(mg_match_t));
 	for (i = 0, n_m = 0, *rep_len = 0, *n_a = 0; i < mv->n; ++i) {
-		const uint64_t *cr;
+		const uint64_t *cr = 0;
 		mg128_t *p = &mv->a[i];
 		uint32_t q_pos = (uint32_t)p->y, q_span = p->x & 0xff;
-		int t;
-		cr = mg_idx_get(gi, p->x>>8, &t);
+		int t = INT32_MAX; // a minimizer flagged by mm_seed_mz_flt() is repetitive by definition
+		if (!(p->y & MG_MINI_FLT)) cr = mg_idx_get(gi, p->x>>8, &t);
 		if (t >= max_occ) {
 			int en = (q_pos >> 1) + 1, st = en - q_span;
 			if (st > rep_en) {
@@ -77,7 +140,7 @@ static mg_match_t *collect_matches(void *km, int *_n_m, int max_occ, const mg_id
 			} else rep_en = en;
 		} else {
 			mg_match_t *q = &m[n_m++];
-			q->q_pos = q_pos, q->q_span = q_span, q->cr = cr, q->n = t, q->seg_id = p->y >> 32;
+			q->q_pos = q_pos, q->q_span = q_span, q->cr = cr, q->n = t, q->seg_id = p->y >> 32 & 0xff;
 			q->is_tandem = 0;
 			if (i > 0 && p->x>>8 == mv->a[i - 1].x>>8) q->is_tandem = 1;
 			if (i < mv->n - 1 && p->x>>8 == mv->a[i + 1].x>>8) q->is_tandem = 1;
@@ -364,6 +427,7 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	hash  = kh_hash_uint32(hash);
 
 	collect_minimizers(b->km, opt, gi, n_segs, qlens, seqs, &mv);
+	if (opt->q_occ_frac > 0.0f) mm_seed_mz_flt(b->km, &mv, opt->occ_max1, opt->q_occ_frac);
 	if (opt->flag & MG_M_HEAP_SORT) a = collect_seed_hits_heap(b->km, opt, opt->occ_max1, gi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
 	else a = collect_seed_hits(b->km, opt, opt->occ_max1, gi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
 
@@ -396,7 +460,7 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	} else {
 		if (opt->flag & MG_M_RMQ) {
 			a = mg_lchain_rmq(opt->max_gap, opt->max_gap_pre, opt->bw, opt->max_lc_skip, opt->rmq_size_cap, opt->min_lc_cnt, opt->min_lc_score,
-							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km);
+							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km, mg_lc_threads(b, opt, qlen_sum, n_a));
 		} else {
 			a = mg_lchain_dp(max_chain_gap_ref, max_chain_gap_qry, opt->bw, opt->max_lc_skip, opt->max_lc_iter, opt->min_lc_cnt, opt->min_lc_score,
 							 chn_pen_gap, chn_pen_skip, is_splice, n_segs, n_a, a, &n_lc, &u, b->km);
@@ -412,7 +476,7 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 			kfree(b->km, u);
 			radix_sort_128x(a, a + n_a);
 			a = mg_lchain_rmq(opt->max_gap, opt->max_gap_pre, opt->bw_long, opt->max_lc_skip, opt->rmq_size_cap, opt->min_lc_cnt, opt->min_lc_score,
-							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km);
+							  chn_pen_gap, chn_pen_skip, n_a, a, &n_lc, &u, b->km, mg_lc_threads(b, opt, qlen_sum, n_a));
 		}
 	}
 
@@ -461,7 +525,8 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	n_gc = mg_gchain1_dp(b->km, gi->g, &n_lc, lc, qlen_sum, opt->bw_long, opt->bw_long, opt->bw_long, opt->max_gc_skip, opt->ref_bonus,
 						 chn_pen_gap, chn_pen_skip, opt->mask_level, a, &u);
 	if (mg_dbg_flag & MG_DBG_QNAME) t = print_time(t, 3, qname);
-	gcs[0] = mg_gchain_gen(0, b->km, gi->g, gi->es, n_gc, u, lc, a, hash, opt->min_gc_cnt, opt->min_gc_score, opt->gdp_max_ed, n_segs, seq_cat);
+	gcs[0] = mg_gchain_gen(0, b->km, gi->g, gi->es, n_gc, u, lc, a, hash, opt->min_gc_cnt, opt->min_gc_score, opt->gdp_max_ed, opt->gdp_drop, n_segs, seq_cat,
+						   mg_par_threads(b, opt, qlen_sum)); // the gap-count threshold is inside
 	if (mg_dbg_flag & MG_DBG_QNAME) t = print_time(t, 4, qname);
 	gcs[0]->rep_len = rep_len;
 	kfree(b->km, a);
@@ -473,8 +538,9 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 	mg_gchain_drop_flt(b->km, gcs[0]);
 	mg_gchain_set_mapq(b->km, gcs[0], qlen_sum, mv.n, opt->min_gc_score);
 	if ((opt->flag&MG_M_CIGAR) && n_segs == 1) {
-		mg_gchain_cigar(b->km, gi->g, gi->es, seq_cat, gcs[0], qname);
-		mg_gchain_gen_ds(b->km, gi->g, gi->es, seq_cat, gcs[0]);
+		mg_gchain_cigar(b->km, gi->g, gi->es, seq_cat, gcs[0], qname, opt->par_align? mg_par_threads(b, opt, qlen_sum) : 1);
+		if (!(opt->flag&MG_M_NO_DS))
+			mg_gchain_gen_ds(b->km, gi->g, gi->es, seq_cat, gcs[0]);
 	}
 	kfree(b->km, seq_cat);
 	if (mg_dbg_flag & MG_DBG_QNAME) t = print_time(t, 5, qname);
