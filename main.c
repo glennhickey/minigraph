@@ -53,6 +53,7 @@ static ko_longopt_t long_options[] = {
 	{ "lc-threads",   ko_required_argument, 331 },
 	{ "gdp-drop",     ko_required_argument, 332 },
 	{ "par-align",    ko_no_argument,       333 },
+	{ "wfa-pen",      ko_required_argument, 334 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -174,6 +175,14 @@ int main(int argc, char *argv[])
 		else if (c == 331) opt.lc_threads = atoi(o.arg);      // --lc-threads
 		else if (c == 332) opt.gdp_drop = atoi(o.arg);        // --gdp-drop
 		else if (c == 333) opt.par_align = 1;                 // --par-align
+		else if (c == 334) { // --wfa-pen
+			int n = sscanf(o.arg, "%d,%d,%d,%d,%d", &opt.wfa_x, &opt.wfa_o1, &opt.wfa_e1, &opt.wfa_o2, &opt.wfa_e2);
+			if (n == 3) opt.wfa_o2 = opt.wfa_o1, opt.wfa_e2 = opt.wfa_e1; // a single affine gap model
+			else if (n != 5) {
+				fprintf(stderr, "[ERROR]\033[1;31m --wfa-pen takes X,O1,E1 or X,O1,E1,O2,E2\033[0m\n");
+				return 1;
+			}
+		}
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -250,6 +259,9 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    --gdp-drop INT\n");
 		fprintf(fp_help, "                 compact bridging wavefronts to those that can reach the target, every INT steps; 0 to only stop when none can [%d]\n", opt.gdp_drop);
 		fprintf(fp_help, "    --par-align  align the anchor gaps of one query in parallel; same output, more CPU [%s]\n", opt.par_align? "on" : "off");
+		fprintf(fp_help, "    --wfa-pen X,O1,E1[,O2,E2]\n");
+		fprintf(fp_help, "                 base-alignment penalties: mismatch, then gap open/extend of the two affine pieces (match is 0);\n");
+		fprintf(fp_help, "                 alignment time grows with their size [%d,%d,%d,%d,%d]\n", opt.wfa_x, opt.wfa_o1, opt.wfa_e1, opt.wfa_o2, opt.wfa_e2);
 		fprintf(fp_help, "    -j FLOAT     expected sequence divergence [%g]\n", opt.div);
 		fprintf(fp_help, "    -g NUM       stop chain enlongation if there are no minimizers in INT-bp [%d]\n", opt.max_gap);
 		fprintf(fp_help, "    -F NUM       max fragment length (effective with -xsr or in the fragment mode) [%d]\n", opt.max_frag_len);

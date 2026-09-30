@@ -1,6 +1,7 @@
 #include <string.h>
 #include "mgpriv.h"
 #include "sys.h"
+#include "miniwfa.h"
 
 void mg_idxopt_init(mg_idxopt_t *io)
 {
@@ -12,6 +13,7 @@ void mg_idxopt_init(mg_idxopt_t *io)
 
 void mg_mapopt_init(mg_mapopt_t *mo)
 {
+	mwf_opt_t wo;
 	memset(mo, 0, sizeof(mg_mapopt_t));
 	mo->seed = 11;
 	mo->occ_max1 = 50, mo->occ_max1_cap = 250;
@@ -46,6 +48,8 @@ void mg_mapopt_init(mg_mapopt_t *mo)
 	mo->min_cov_mapq = 20;
 	mo->min_cov_blen = 1000;
 	mo->cap_kalloc = 1000000000;
+	mwf_opt_init(&wo); // miniwfa's defaults, so that the output is unchanged unless --wfa-pen is given
+	mo->wfa_x = wo.x, mo->wfa_o1 = wo.o1, mo->wfa_e1 = wo.e1, mo->wfa_o2 = wo.o2, mo->wfa_e2 = wo.e2;
 }
 
 void mg_ggopt_init(mg_ggopt_t *go)
@@ -116,6 +120,11 @@ int mg_opt_check(const mg_idxopt_t *io, const mg_mapopt_t *mo, const mg_ggopt_t 
 	if ((mo->flag & MG_M_FRAG_MODE) && !(mo->flag & MG_M_FRAG_MERGE)) {
 		if (mg_verbose >= 1)
 			fprintf(stderr, "[ERROR]\033[1;31m the fragment-without-merge mode is not implemented\033[0m\n");
+		return -1;
+	}
+	if (mo->wfa_x <= 0 || mo->wfa_o1 < 0 || mo->wfa_e1 <= 0 || mo->wfa_o2 < 0 || mo->wfa_e2 <= 0) {
+		if (mg_verbose >= 1)
+			fprintf(stderr, "[ERROR]\033[1;31m --wfa-pen needs a positive mismatch and gap extensions, and non-negative gap opens\033[0m\n");
 		return -1;
 	}
 	return 0;

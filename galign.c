@@ -159,10 +159,18 @@ typedef struct {
 	const gfa_t *g;
 	const gfa_edseq_t *es;
 	const mg_gchains_t *gt;
+	const mg_mapopt_t *mo;
 	const char *qseq, *qname;
 	cigar_task_t *task;
 	cigar_worker_t *w;   // one per thread
 } cigar_par_t;
+
+static void cigar_wfa_opt(const mg_mapopt_t *mo, mwf_opt_t *opt)
+{
+	mwf_opt_init(opt);
+	opt->flag |= MWF_F_CIGAR;
+	opt->x = mo->wfa_x, opt->o1 = mo->wfa_o1, opt->e1 = mo->wfa_e1, opt->o2 = mo->wfa_o2, opt->e2 = mo->wfa_e2;
+}
 
 static void cigar_worker(void *data, long k, int tid) // kt_for() callback: one alignment per call
 {
@@ -182,8 +190,7 @@ static void cigar_worker(void *data, long k, int tid) // kt_for() callback: one 
 	if (w->km_wfa == 0) w->km_wfa = km_init2(0, 0x10000);
 	l_seq = cigar_tseq(0, cp->g, cp->es, cp->gt, t->l0, t->l, (int32_t)q->x, (int32_t)cp->gt->a[t->off_a0 + t->j].x, &w->seq, &w->m_seq);
 	assert(l_seq == t->l_seq);
-	mwf_opt_init(&opt);
-	opt.flag |= MWF_F_CIGAR;
+	cigar_wfa_opt(cp->mo, &opt);
 	mwf_wfa_auto(w->km_wfa, &opt, l_seq, w->seq, t->qlen, qs, &rst);
 	t->n_cigar = rst.n_cigar;
 	if (rst.n_cigar > 0) { // keep the CIGAR for Phase C
@@ -208,7 +215,7 @@ static void cigar_worker(void *data, long k, int tid) // kt_for() callback: one 
 }
 
 // With n_threads > 1 the gaps that need an alignment are aligned in parallel; the CIGAR does not depend on n_threads.
-void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt, const char *qname, int n_threads) // qname for debugging only
+void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char *qseq, mg_gchains_t *gt, const char *qname, const mg_mapopt_t *mo, int n_threads) // qname for debugging only
 {
 	int32_t i, l_seq = 0, m_seq = 0;
 	int32_t par, n_task = 0, m_task = 0, ti = 0, nt = 0;
@@ -252,7 +259,7 @@ void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char
 			if (nt > n_task) nt = n_task;
 			KCALLOC(km, w, nt);
 			memset(&cp, 0, sizeof(cp));
-			cp.g = g, cp.es = es, cp.gt = gt, cp.qseq = qseq, cp.qname = qname, cp.task = task, cp.w = w;
+			cp.g = g, cp.es = es, cp.gt = gt, cp.mo = mo, cp.qseq = qseq, cp.qname = qname, cp.task = task, cp.w = w;
 			if (nt > 1) kt_for(nt, cigar_worker, &cp, n_task);
 			else for (i = 0; i < n_task; ++i) cigar_worker(&cp, i, 0);
 		}
@@ -290,8 +297,7 @@ void mg_gchain_cigar(void *km, const gfa_t *g, const gfa_edseq_t *es, const char
 				} else {
 					mwf_opt_t opt;
 					mwf_rst_t rst;
-					mwf_opt_init(&opt);
-					opt.flag |= MWF_F_CIGAR;
+					cigar_wfa_opt(mo, &opt);
 					mwf_wfa_auto(km2, &opt, l_seq, seq, qlen, qs, &rst);
 					append_cigar(km, &cigar, rst.n_cigar, rst.cigar);
 					kfree(km2, rst.cigar);
