@@ -164,8 +164,10 @@ of 4+1.5k and 15+0.5k.
 Only the CIGAR between the anchors of a chain changes: seeding, chaining and
 so the mappings themselves do not depend on this option. miniwfa computes
 every score up to the alignment's, so larger penalties make base alignment
-slower, and the closed-form alignment of runs of N is only taken with the
-default penalties.
+slower. A gap that is a run of N on one side is aligned in closed form, as a
+deletion and an insertion, whenever that is the unique optimum: with any
+penalties where a mismatch costs more than an insertion plus a deletion
+base, that is all but the shortest.
 .TP
 .BI -j \ FLOAT
 Expected query-graph sequence divergence [0.1]
