@@ -690,37 +690,62 @@ wf_chkpt_t *mwf_wfa_seg(void *km, const mwf_opt_t *opt, int32_t tl, const char *
 	return seg;
 }
 
+static inline int64_t wf_gap_pen0(const mwf_opt_t *opt, int32_t len) // as wf_gap_pen(), but 0 for no gap
+{
+	int64_t s1, s2;
+	if (len == 0) return 0;
+	s1 = opt->o1 + (int64_t)opt->e1 * len, s2 = opt->o2 + (int64_t)opt->e2 * len;
+	return s1 < s2? s1 : s2;
+}
+
 /*
  * Shortcut for a gap where, after trimming the exact prefix (p) and suffix (q), one side is a run of 'N' and the other
- * side has no 'N'. As 'N' matches nothing, the optimal alignment deletes the N run and inserts the other middle, with
- * score 2*o2+e2*(tm+qm) (assuming the default scoring and tm,qm>=16); it is only ambiguous in the placement of the two
- * gaps, which is resolved as wf_traceback() would. max_s and max_iter are honored by bounding the number of cells the
- * full WFA would visit. Return 0 if the shortcut does not apply.
+ * side has no 'N'. As 'N' matches nothing, an alignment of the two middles is k mismatches, a deletion of tm-k and an
+ * insertion of qm-k, and when two gaps (k=0) are cheaper than any k>0 they are the optimal alignment, which deletes the
+ * N run and inserts the other middle. With the default scoring that holds for tm,qm>=16, with score 2*o2+e2*(tm+qm);
+ * with other penalties every k is checked (and a gap open must cost something, or more gaps would do as well). The
+ * optimal alignment is then only ambiguous in the placement of the two gaps, which is resolved as wf_traceback() would.
+ * Along a tandem repeat a gap can slide further than its own length. max_s is honored, and with the default scoring
+ * so is max_iter, by bounding the number of cells the full WFA would visit. With other penalties the cap is not
+ * modelled, so this can return the optimal alignment where the capped WFA would have given up. Return 0 if the
+ * shortcut does not apply.
  */
 static int wf_ngap(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, int32_t ql, const char *qs, mwf_rst_t *r)
 {
-	int32_t i, n, p, q, tm, qm, nm, nl, rl, a, b, s, in_t;
+	int32_t i, n, p, q, tm, qm, nm, nl, a, b, in_t, def;
+	int64_t s;
 	const char *N, *R, *T;
 	wf_cigar_t c = {0,0,0};
 
-	if (opt->x != 4 || opt->o1 != 4 || opt->e1 != 2 || opt->o2 != 15 || opt->e2 != 1) return 0;
+	def = (opt->x == 4 && opt->o1 == 4 && opt->e1 == 2 && opt->o2 == 15 && opt->e2 == 1);
+	if (!def && (opt->o1 <= 0 || opt->o2 <= 0)) return 0;
 	in_t = (memchr(ts, 'N', tl) != 0);
 	if (in_t == (memchr(qs, 'N', ql) != 0)) return 0; // exactly one side has 'N'
 	for (p = 0; p < tl && p < ql && ts[p] == qs[p]; ++p) {}
 	for (q = 0; p + q < tl && p + q < ql && ts[tl-1-q] == qs[ql-1-q]; ++q) {}
 	tm = tl - p - q, qm = ql - p - q;
-	if (tm < 16 || qm < 16) return 0; // mismatches could be cheaper than two gaps
-	if (in_t) N = ts, nl = tl, nm = tm, R = qs + p, rl = qm;
-	else N = qs, nl = ql, nm = qm, R = ts + p, rl = tm;
+	if (def && (tm < 16 || qm < 16)) return 0; // mismatches could be cheaper than two gaps
+	if (tm == 0 || qm == 0) return 0;
+	if (in_t) N = ts, nl = tl, nm = tm, R = qs + p;
+	else N = qs, nl = ql, nm = qm, R = ts + p;
 	for (i = 0, n = 0; i < nl; ++i) n += (N[i] == 'N');
 	if (n != nm) return 0; // the middle of the N side is not all 'N'
-	s = 2 * opt->o2 + opt->e2 * (tm + qm);
+	if (def) {
+		s = 2 * opt->o2 + opt->e2 * (tm + qm);
+	} else {
+		int32_t k, m = tm < qm? tm : qm;
+		s = wf_gap_pen0(opt, tm) + wf_gap_pen0(opt, qm);
+		for (k = 1; k <= m && (int64_t)k * opt->x <= s; ++k) // past that, the mismatches alone cost more than the gaps
+			if ((int64_t)k * opt->x + wf_gap_pen0(opt, tm - k) + wf_gap_pen0(opt, qm - k) <= s)
+				return 0; // the two gaps are not the unique optimum
+		if (s > INT32_MAX) return 0;
+	}
 	memset(r, 0, sizeof(*r));
 	if (opt->max_s > 0 && s > opt->max_s) {
 		r->s = -1;
 		return 1;
 	}
-	if (opt->max_iter > 0) {
+	if (def && opt->max_iter > 0) {
 		// The band grows by one diagonal per side per score until clamped, and wf_stripe_shrink() only drops a diagonal
 		// after a path of the current score could have left the matrix on it. This gives an upper and a lower bound.
 		int64_t lo = 0, hi = 0;
@@ -741,7 +766,7 @@ static int wf_ngap(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, i
 	r->s = s;
 	if (!(opt->flag & MWF_F_CIGAR)) return 1;
 	T = ts + tl - q; // the suffix
-	for (a = 0; a < q && a < rl && T[a] == R[a]; ++a) {} // the gap after the N run may slide right by a
+	for (a = 0; a < q && T[a] == R[a]; ++a) {} // the gap after the N run may slide right by a (R runs on into the suffix)
 	if (in_t) { // N run on the target: deletion, then insertion
 		if (p) wf_cigar_push1(km, &c, 7, p);
 		wf_cigar_push1(km, &c, 2, tm);
@@ -749,7 +774,7 @@ static int wf_ngap(void *km, const mwf_opt_t *opt, int32_t tl, const char *ts, i
 		wf_cigar_push1(km, &c, 1, qm);
 		if (a < q) wf_cigar_push1(km, &c, 7, q);
 	} else if (a == 0) { // N run on the query: deletion, then insertion; the deletion may slide left by b
-		for (b = 0; b < p && b < tm && ts[p-1-b] == R[tm-1-b]; ++b) {}
+		for (b = 0; b < p && ts[p-1-b] == R[tm-1-b]; ++b) {} // R[tm-1-b] runs back into the prefix
 		if (p - b) wf_cigar_push1(km, &c, 7, p - b);
 		wf_cigar_push1(km, &c, 2, tm);
 		if (b) wf_cigar_push1(km, &c, 7, b);

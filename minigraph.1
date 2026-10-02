@@ -149,6 +149,26 @@ fair-share-by-length budget the chaining and the bridging use, so
 .B --lc-threads
 applies to this stage too.
 .TP
+.BI --wfa-pen \ X,O1,E1[,O2,E2]
+Penalties for base alignment
+.RB ( -c )
+[4,4,2,15,1]: the mismatch penalty, then the gap open and extension penalties
+of the two pieces of the dual affine gap model, where a gap of length
+.I k
+costs min{O1+k*E1,O2+k*E2}. miniwfa scores a match as 0, so there is one
+mismatch penalty and no substitution matrix. With three values the second
+piece is the same as the first, which is a single affine gap model. The
+defaults correspond to a Smith-Waterman match score of 1, mismatch 3, and gaps
+of 4+1.5k and 15+0.5k.
+.IP
+Only the CIGAR between the anchors of a chain changes: seeding, chaining and
+so the mappings themselves do not depend on this option. miniwfa computes
+every score up to the alignment's, so larger penalties make base alignment
+slower. A gap that is a run of N on one side is aligned in closed form, as a
+deletion and an insertion, whenever that is the unique optimum: with any
+penalties where a mismatch costs more than an insertion plus a deletion
+base, that is all but the shortest.
+.TP
 .BI -j \ FLOAT
 Expected query-graph sequence divergence [0.1]
 .TP
