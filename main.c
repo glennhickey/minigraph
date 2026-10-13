@@ -54,6 +54,11 @@ static ko_longopt_t long_options[] = {
 	{ "gdp-drop",     ko_required_argument, 332 },
 	{ "par-align",    ko_no_argument,       333 },
 	{ "wfa-pen",      ko_required_argument, 334 },
+	{ "gc-max-del",   ko_required_argument, 335 },
+	{ "gc-del-cap",   ko_required_argument, 336 },
+	{ "gc-mask",      ko_required_argument, 337 },
+	{ "ggs-self-ovlp", ko_no_argument,      338 },
+	{ "ggs-cnv",      ko_no_argument,       339 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -121,6 +126,9 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "[ERROR] unknown preset '%s'\n", o.arg);
 				return 1;
 			}
+		} else if (c == 339) { // --ggs-cnv: the combination tested on the AMY1/AMY2 locus; set here, so that explicit --gc-* options override it
+			opt.gc_max_del = 300000, opt.gc_del_cap = 10000.0f, opt.gc_mask_level = 0.95f;
+			gpt.flag |= MG_G_SELF_OVLP;
 		} else if (c == ':') {
 			fprintf(stderr, "[ERROR] missing option argument\n");
 			return 1;
@@ -183,6 +191,13 @@ int main(int argc, char *argv[])
 				return 1;
 			}
 		}
+		else if (c == 335) { // --gc-max-del
+			int64_t x = mm_parse_num(o.arg);
+			opt.gc_max_del = x < 0 || x > INT32_MAX? -1 : x; // rejected by mg_opt_check()
+		}
+		else if (c == 336) opt.gc_del_cap = atof(o.arg);     // --gc-del-cap
+		else if (c == 337) opt.gc_mask_level = atof(o.arg);  // --gc-mask
+		else if (c == 338) gpt.flag |= MG_G_SELF_OVLP;       // --ggs-self-ovlp
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -278,6 +293,21 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    -d NUM       min alignment length for depth calculation [%d]\n", gpt.min_depth_len);
 		fprintf(fp_help, "    -L INT       min variant length [%d]\n", gpt.min_var_len);
 		fprintf(fp_help, "    --call       call the graph path in each bubble and output BED\n");
+		fprintf(fp_help, "    --gc-max-del NUM\n");
+		fprintf(fp_help, "                 graph chaining: link two chains that touch or overlap on the query (a deletion with\n");
+		fprintf(fp_help, "                 breakpoint homology) when their graph and query distances differ by up to NUM bp; no\n");
+		fprintf(fp_help, "                 effect up to the second -r value, which still bounds the graph search [%d]\n", opt.gc_max_del);
+		fprintf(fp_help, "    --gc-del-cap FLOAT\n");
+		fprintf(fp_help, "                 graph chaining: cap the linear gap cost of a link between two such chains at FLOAT;\n");
+		fprintf(fp_help, "                 negative to disable [%g]\n", opt.gc_del_cap);
+		fprintf(fp_help, "    --gc-mask FLOAT\n");
+		fprintf(fp_help, "                 graph chaining: max overlap between two linked chains, on the query and, within one\n");
+		fprintf(fp_help, "                 segment, on the graph, as a fraction of the shorter chain; negative for -M [%g]\n", opt.gc_mask_level);
+		fprintf(fp_help, "    --ggs-self-ovlp\n");
+		fprintf(fp_help, "                 with -c, insert a variant even where its own chain passes the graph twice (a copy\n");
+		fprintf(fp_help, "                 gain); the two passes may add near-identical alleles to one bubble\n");
+		fprintf(fp_help, "    --ggs-cnv    --gc-max-del 300000 --gc-del-cap 10000 --gc-mask 0.95 --ggs-self-ovlp, for graph\n");
+		fprintf(fp_help, "                 generation with -c, not for mapping; explicit --gc-* options override it\n");
 		fprintf(fp_help, "  Input/output:\n");
 		fprintf(fp_help, "    -t INT       number of threads [%d]\n", n_threads);
 		fprintf(fp_help, "    -o FILE      output mappings to FILE [stdout]\n");

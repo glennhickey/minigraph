@@ -38,6 +38,7 @@
 #define MG_G_CAL_COV      0x2
 #define MG_G_NO_INV       0x4
 #define MG_G_CALL         0x8
+#define MG_G_SELF_OVLP    0x10
 
 typedef struct { uint64_t x, y; } mg128_t;
 typedef struct { size_t n, m; mg128_t *a; } mg128_v;
@@ -70,6 +71,9 @@ typedef struct {
 	int min_gc_cnt, min_gc_score;
 	int gdp_max_ed, gdp_drop, par_align, lc_max_trim, lc_max_occ;
 	float mask_level;
+	int gc_max_del;      // graph chaining: allow a link between chains that touch or overlap on the query up to this length difference; <= bw_long has no effect
+	float gc_del_cap;    // graph chaining: cap the linear gap cost of such a link; negative to disable
+	float gc_mask_level; // graph chaining: overlap allowed between linked chains; negative to use mask_level
 	int sub_diff;
 	int best_n;
 	float pri_ratio;
