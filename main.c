@@ -53,6 +53,7 @@ static ko_longopt_t long_options[] = {
 	{ "lc-threads",   ko_required_argument, 331 },
 	{ "gdp-drop",     ko_required_argument, 332 },
 	{ "par-align",    ko_no_argument,       333 },
+	{ "no-par-align", ko_no_argument,       340 },
 	{ "wfa-pen",      ko_required_argument, 334 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
@@ -174,7 +175,8 @@ int main(int argc, char *argv[])
 		else if (c == 330) opt.q_occ_frac = atof(o.arg);      // --q-occ-frac
 		else if (c == 331) opt.lc_threads = atoi(o.arg);      // --lc-threads
 		else if (c == 332) opt.gdp_drop = atoi(o.arg);        // --gdp-drop
-		else if (c == 333) opt.par_align = 1;                 // --par-align
+		else if (c == 333) opt.par_align = 1;                 // --par-align (the default)
+		else if (c == 340) opt.par_align = 0;                 // --no-par-align
 		else if (c == 334) { // --wfa-pen
 			int n = sscanf(o.arg, "%d,%d,%d,%d,%d", &opt.wfa_x, &opt.wfa_o1, &opt.wfa_e1, &opt.wfa_o2, &opt.wfa_e2);
 			if (n == 3) opt.wfa_o2 = opt.wfa_o1, opt.wfa_e2 = opt.wfa_e1; // a single affine gap model
@@ -255,10 +257,12 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    --q-occ-frac FLOAT\n");
 		fprintf(fp_help, "                 ignore a query minimizer occurring in >FLOAT of query minimizers [%g]\n", opt.q_occ_frac);
 		fprintf(fp_help, "    --lc-threads INT\n");
-		fprintf(fp_help, "                 threads for chaining and bridging one query sequence; 0 for auto [%d]\n", opt.lc_threads);
+		fprintf(fp_help, "                 threads for chaining, bridging and (unless --no-par-align) base-aligning one query sequence; 0 for auto [%d]\n", opt.lc_threads);
 		fprintf(fp_help, "    --gdp-drop INT\n");
 		fprintf(fp_help, "                 compact bridging wavefronts to those that can reach the target, every INT steps; 0 to only stop when none can [%d]\n", opt.gdp_drop);
 		fprintf(fp_help, "    --par-align  align the anchor gaps of one query in parallel; same output, more CPU [%s]\n", opt.par_align? "on" : "off");
+		fprintf(fp_help, "    --no-par-align\n");
+		fprintf(fp_help, "                 align the anchor gaps of a query serially; same output, least CPU and memory\n");
 		fprintf(fp_help, "    --wfa-pen X,O1,E1[,O2,E2]\n");
 		fprintf(fp_help, "                 base-alignment penalties: mismatch, then gap open/extend of the two affine pieces (match is 0);\n");
 		fprintf(fp_help, "                 alignment time grows with their size [%d,%d,%d,%d,%d]\n", opt.wfa_x, opt.wfa_o1, opt.wfa_e1, opt.wfa_o2, opt.wfa_e2);

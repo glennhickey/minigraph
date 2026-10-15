@@ -76,7 +76,7 @@ typedef struct {
 	int ref_bonus;
 	int64_t cap_kalloc;
 	int min_cov_mapq, min_cov_blen;
-	int lc_threads; // 0 for auto: # threads for chaining one query sequence
+	int lc_threads; // 0 for auto: # threads for chaining, bridging and (with par_align) base-aligning one query sequence
 	int wfa_x, wfa_o1, wfa_e1, wfa_o2, wfa_e2; // base-alignment (-c) penalties: mismatch and the two affine gap pieces
 } mg_mapopt_t;
 
