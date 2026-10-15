@@ -87,10 +87,13 @@ minimizers than the occurrence threshold, and therefore does not apply to
 short reads.
 .TP
 .BI --lc-threads \ INT
-Number of threads used to chain the anchors of one query sequence and to
-bridge the gaps between its linear chains [0]. Linear chaining is independent
-for each (segment,strand) group of anchors, and bridging is independent for
-each gap, so both can be parallelized within a single query. 0 selects the
+Number of threads used to chain the anchors of one query sequence, to bridge
+the gaps between its linear chains and, unless
+.B --no-par-align
+is given, to base-align the gaps between its anchors [0]. Linear chaining is
+independent for each (segment,strand) group of anchors, and bridging and
+alignment are independent for each gap, so all three can be parallelized within
+a single query. 0 selects the
 number automatically:
 each query sequence gets its share, by length, of
 .B -t
@@ -124,7 +127,7 @@ Regardless of this option, a bridge is abandoned as soon as
 live diagonal is infeasible, which cannot change the result.
 .TP
 .B --par-align
-Align the anchor gaps of one query sequence in parallel [off]. Base alignment
+Align the anchor gaps of one query sequence in parallel [on]. Base alignment
 .RB ( -c )
 walks the anchors of every graph chain in order and aligns the gap between
 consecutive anchors with miniwfa; on a chromosome-scale query that is the
@@ -136,8 +139,7 @@ threads, and then replayed into the CIGAR in the original order, so the
 alignment itself is unchanged: the output is byte-identical with the option on
 or off and at any thread count.
 .IP
-It is off by default because it buys wall-clock time with CPU time and a little
-memory. Each worker keeps its own miniwfa working set and its own copy of the
+It buys wall-clock time with CPU time and a little memory. Each worker keeps its own miniwfa working set and its own copy of the
 CIGARs it produced, so the peak is higher, and the shorter queries lose their
 share of the machine to the long one. On a 459-haplotype chr16 build at -t 8
 the alignment stage of the 92.9 Mb contig goes from 99.0 to 55.0 seconds
@@ -147,7 +149,16 @@ the alignment stage of the 92.9 Mb contig goes from 99.0 to 55.0 seconds
 now competes with eight busy cores. The thread count is the same
 fair-share-by-length budget the chaining and the bridging use, so
 .B --lc-threads
-applies to this stage too.
+applies to this stage too. That trade is the one Minigraph-Cactus wants, so the
+option is on by default;
+.B --no-par-align
+turns it off.
+.TP
+.B --no-par-align
+Align the anchor gaps of a query one after another, as minigraph always did
+before
+.BR --par-align ,
+for the least CPU and memory. The output is the same.
 .TP
 .BI --wfa-pen \ X,O1,E1[,O2,E2]
 Penalties for base alignment
