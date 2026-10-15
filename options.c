@@ -40,6 +40,7 @@ void mg_mapopt_init(mg_mapopt_t *mo)
 	mo->lc_max_trim = 50;
 	mo->lc_max_occ = 2;
 	mo->mask_level = 0.5f;
+	mo->gc_max_del = 0, mo->gc_del_cap = -1.0f, mo->gc_mask_level = -1.0f;
 	mo->sub_diff = 6;
 	mo->best_n = 5;
 	mo->pri_ratio = 0.8f;
@@ -125,6 +126,11 @@ int mg_opt_check(const mg_idxopt_t *io, const mg_mapopt_t *mo, const mg_ggopt_t 
 	if (mo->wfa_x <= 0 || mo->wfa_o1 < 0 || mo->wfa_e1 <= 0 || mo->wfa_o2 < 0 || mo->wfa_e2 <= 0) {
 		if (mg_verbose >= 1)
 			fprintf(stderr, "[ERROR]\033[1;31m --wfa-pen needs a positive mismatch and gap extensions, and non-negative gap opens\033[0m\n");
+		return -1;
+	}
+	if (mo->gc_max_del < 0 || mo->gc_mask_level > 1.0f) {
+		if (mg_verbose >= 1)
+			fprintf(stderr, "[ERROR]\033[1;31m --gc-max-del must be non-negative and below 2G, and --gc-mask at most 1\033[0m\n");
 		return -1;
 	}
 	return 0;

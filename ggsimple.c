@@ -54,9 +54,11 @@ int32_t mg_gc_index(void *km, int min_mapq, int min_map_len, int min_depth_len, 
 		for (i = 0; i < gt->n_gc; ++i) {
 			const mg_gchain_t *gc = &gt->gc[i];
 			mg_intv_t *p;
+			int32_t cid;
 			if (gc->id != gc->parent) continue;
 			if (gc->blen < min_depth_len || gc->mapq < min_mapq) continue;
-			p = &qintv[qoff[t] + qcnt[t]];
+			cid = qoff[t] + qcnt[t];
+			p = &qintv[cid];
 			++qcnt[t];
 			p->st = gc->qs, p->en = gc->qe, p->rev = 0, p->far = -1, p->i = -1;
 			for (j = 0; j < gc->cnt; ++j) {
@@ -77,7 +79,7 @@ int32_t mg_gc_index(void *km, int min_mapq, int min_map_len, int min_depth_len, 
 				} else rs = 0, re = g->seg[lc->v>>1].len;
 				p = &sintv[soff[lc->v>>1] + scnt[lc->v>>1]];
 				++scnt[lc->v>>1];
-				p->st = rs, p->en = re, p->rev = lc->v&1, p->far = -1, p->i = -1;
+				p->st = rs, p->en = re, p->rev = lc->v&1, p->far = -1, p->i = cid; // the chain this interval comes from
 			}
 		}
 	}
@@ -407,12 +409,14 @@ void mg_ggsimple_cigar(void *km, const mg_ggopt_t *opt, gfa_t *g, int32_t n_seq,
 	n_inv = 0;
 	for (t = 0; t < n_seq; ++t) {
 		const mg_gchains_t *gt = gcs[t];
+		int32_t n_idx = 0; // number of this sequence's chains in the interval index so far
 		for (i = 0; i < gt->n_gc; ++i) {
 			const mg_gchain_t *gc = &gt->gc[i];
-			int32_t j, n_ss, n_intv, *sc;
+			int32_t j, n_ss, n_intv, *sc, cid = -1;
 			ed_intv_t *intv;
 			mg_msseg_t *ss;
 			if (gc->id != gc->parent) continue;
+			if (gc->blen >= opt->min_depth_len && gc->mapq >= opt->min_mapq) cid = qoff[t] + n_idx++; // as numbered by mg_gc_index()
 			if (gc->p == 0 || gc->blen < opt->min_map_len || gc->mapq < opt->min_mapq) continue;
 			assert(gc->cnt > 0);
 
@@ -488,6 +492,12 @@ void mg_ggsimple_cigar(void *km, const mg_ggopt_t *opt, gfa_t *g, int32_t n_seq,
 					}
 					n_ovlp = mg_intv_overlap(km, soff[(v>>1)+1] - soff[v>>1], &sintv[soff[v>>1]], s, e, &ovlp, &m_ovlp);
 					if (n_ovlp == 0) fprintf(stderr, "[W::%s] graph interval %c%s:%d-%d is not covered by %s:%d-%d\n", __func__, "><"[v&1], g->seg[v>>1].name, s, e, seq[t].name, I.coff[0], I.coff[1]); // this should be an assert()
+					if (n_ovlp > 1 && (opt->flag & MG_G_SELF_OVLP) && cid >= 0) { // a chain that passes a segment twice (e.g. through inverted copies) only overlaps itself
+						int32_t q;
+						for (q = 0; q < n_ovlp; ++q)
+							if (sintv[soff[v>>1] + ovlp[q]].i != cid) break;
+						if (q == n_ovlp) n_ovlp = 1;
+					}
 					if (n_ovlp != 1) break;
 				}
 				if (k <= ie->lc) continue;

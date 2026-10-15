@@ -38,7 +38,7 @@ static int32_t mg_target_dist(const gfa_t *g, const mg_lchain_t *l0, const mg_lc
 }
 
 static inline int32_t cal_sc(const mg_path_dst_t *dj, const mg_lchain_t *li, const mg_lchain_t *lc, const mg128_t *an, const gc_frag_t *a, const int32_t *f,
-							 int bw, int ref_bonus, float chn_pen_gap)
+							 int bw, int ref_bonus, float chn_pen_gap, int32_t max_del, float del_cap)
 {
 	const mg_lchain_t *lj;
 	int32_t gap, sc, segi, segj;
@@ -49,12 +49,16 @@ static inline int32_t cal_sc(const mg_path_dst_t *dj, const mg_lchain_t *li, con
 	lj = &lc[a[dj->meta].i];
 	segj = (an[lj->off + lj->cnt - 1].y & MG_SEED_SEG_MASK) >> MG_SEED_SEG_SHIFT;
 	if (gap < 0) gap = -gap;
-	if (segi == segj && gap > bw) return INT32_MIN;
+	if (segi == segj && gap > bw) { // with max_del, a deletion whose chains touch or overlap on the query (breakpoint homology) may skip up to max_del
+		if (max_del <= bw || gap > max_del || li->qs > lj->qe)
+			return INT32_MIN;
+	}
 	if (lj->qe <= li->qs) sc = li->score;
 	else sc = (int32_t)((double)(li->qe - lj->qe) / (li->qe - li->qs) * li->score + .499); // dealing with overlap on query
 	//sc += dj->mlen; // TODO: is this line the right thing to do?
 	if (dj->is_0) sc += ref_bonus;
 	lin_pen = chn_pen_gap * (float)gap;
+	if (del_cap >= 0.0f && lin_pen > del_cap && li->qs <= lj->qe) lin_pen = del_cap; // a long deletion costs no more than del_cap
 	log_pen = gap >= 2? mg_log2(gap) : 0.0f;
 	sc -= (int32_t)(lin_pen + log_pen);
 	sc += f[dj->meta];
@@ -62,7 +66,7 @@ static inline int32_t cal_sc(const mg_path_dst_t *dj, const mg_lchain_t *li, con
 }
 
 int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc, int32_t qlen, int32_t max_dist_g, int32_t max_dist_q, int32_t bw, int32_t max_skip,
-					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, const mg128_t *an, uint64_t **u_)
+					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, int32_t max_del, float del_cap, const mg128_t *an, uint64_t **u_)
 {
 	int32_t i, j, k, m_dst, n_dst, n_ext, n_u, n_v, n_lc = *n_lc_;
 	int32_t *f, *v, *t;
@@ -72,6 +76,8 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 	gc_frag_t *a;
 	mg_lchain_t *swap;
 	char *qs;
+	int32_t max_dist_g_del = max_dist_g > max_del? max_dist_g : max_del; // candidate limits, widened for long deletions; cal_sc() still caps the length difference at bw unless the chains touch on the query, but not the graph distance
+	int32_t bw_del = bw > max_del? bw : max_del;
 
 	*u_ = 0;
 	if (n_lc == 0) return 0;
@@ -136,16 +142,16 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 				}
 				if (li->v != lj->v) { // the two linear chains are on two different segments
 					int32_t min_dist = li->rs + (g->seg[lj->v>>1].len - lj->re); // minimal graph gap
-					if (min_dist > max_dist_g) continue; // graph gap too large
-					if (segi == segj && min_dist - bw > li->qs - lj->qe) continue; // when li->qs < lj->qe, the condition turns to min_dist + (lj->qe - li->qs) > bw, which is desired
+					if (min_dist > max_dist_g_del) continue; // graph gap too large
+					if (segi == segj && min_dist - bw_del > li->qs - lj->qe) continue; // when li->qs < lj->qe, the condition turns to min_dist + (lj->qe - li->qs) > bw, which is desired
 					target_dist = mg_target_dist(g, lj, li);
 					if (target_dist < 0) continue; // this may happen if the query overlap is far too large
 				} else if (lj->rs >= li->rs || lj->re >= li->re) { // not colinear
 					continue;
 				} else {
 					int32_t dr = li->rs - lj->re, w = dr > dq? dr - dq : dq - dr;
-					if (segi == segj && w > bw) continue; // test bandwidth
-					if (dr > max_dist_g || dr < -max_dist_g) continue;
+					if (segi == segj && w > bw_del) continue; // test bandwidth
+					if (dr > max_dist_g_del || dr < -max_dist_g_del) continue;
 					if (lj->re > li->rs) { // test overlap on the graph segment
 						int o = lj->re - li->rs;
 						if (o > (lj->re - lj->rs) * mask_level || o > (li->re - li->rs) * mask_level)
@@ -179,7 +185,7 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 				mg_path_dst_t *dj = &dst[j];
 				int32_t sc;
 				if (dj->n_path == 0) continue; // not reachable
-				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap);
+				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap, max_del, del_cap);
 				if (sc == INT32_MIN) continue; // out of band
 				if (sc + li->score < 0) continue; // negative score and too low
 				dst[k++] = dst[j];
@@ -192,7 +198,7 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 			for (j = 0; j < n_dst; ++j) {
 				mg_path_dst_t *dj = &dst[j];
 				int32_t sc;
-				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap);
+				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap, max_del, del_cap);
 				if (sc == INT32_MIN) continue;
 				if (mg_dbg_flag & MG_DBG_GC1) {
 					mg_lchain_t *lj = &lc[a[dj->meta].i];

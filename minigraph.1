@@ -299,6 +299,79 @@ Forcefully resolve query overlaps [no]. Effective without
 .BR --inv = yes | no
 Generate graphs with inversions or not [yes]
 .TP
+.BI --gc-max-del \ NUM
+In graph chaining, let two chains that touch or overlap on the query be linked
+when their graph and query distances differ by up to
+.I NUM
+bp, which is beyond the second
+.B -r
+value [0]. Such a link is a deletion against the graph whose breakpoints share
+some homology, as a copy-number loss by non-allelic recombination does. Without
+the option, a haplotype that lost a long repeat copy chains through a
+near-identical paralog, or through a shorter deletion that an earlier genome
+added, and the graph records a misplaced copy. A value up to the second
+.B -r
+value has no effect.
+.IP
+Two chains separated by unaligned query, as at a deletion without breakpoint
+homology, are still limited by
+.BR -r ,
+and so is the graph search radius: across segments, the graph sequence that a
+link skips before the last segment must still be within the second
+.B -r
+value. The candidate filters on graph distance are widened for every link,
+though, so a link with query between its chains may now span up to
+.I NUM
+bp of graph if its length difference stays within
+.BR -r .
+.TP
+.BI --gc-del-cap \ FLOAT
+Cap the linear gap cost of a graph-chaining link whose chains touch or overlap
+on the query at
+.I FLOAT
+[-1, disabled]. Under
+.BR "-x ggs" ,
+the linear cost is 0.827 per bp of length difference, so without a cap a long
+deletion costs more than the chain it adds.
+.TP
+.BI --gc-mask \ FLOAT
+Overlap allowed between two linked chains in graph chaining, on the query and,
+for two chains on one segment, on the graph, as a fraction of the shorter chain
+[-1, the
+.B -M
+value]. Raising it lets two chains share a duplicated breakpoint region. Linear
+chaining and the primary/secondary decision still use
+.BR -M .
+.TP
+.B --ggs-self-ovlp
+With
+.BR -c ,
+insert a variant even where the only graph intervals it overlaps come from its
+own chain [off]. Graph generation skips a variant whose graph interval is
+covered by more than one chain of the batch, and an interval that a chain
+passes twice counts twice, as when a haplotype with an extra copy loops back
+through inverted copies. So without this option an extra copy is never inserted
+and its carriers keep mapping to the existing copies with many edits. The two
+passes of the chain may then add two near-identical alleles to one bubble.
+Without
+.B -c
+it has no effect.
+.TP
+.B --ggs-cnv
+For graph generation with
+.BR -c :
+.B --gc-max-del
+300000
+.B --gc-del-cap
+10000
+.B --gc-mask
+0.95
+.BR --ggs-self-ovlp ,
+the combination tested on the AMY1/AMY2 locus of chr1. Explicit
+.B --gc-*
+options override it, in any order. The chaining part changes mappings as well,
+so do not use it to map to the finished graph.
+.TP
 .B --cov
 Remap and generate segment and link use frequencies. This option triggers GFA
 output. When used with
