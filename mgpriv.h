@@ -43,6 +43,7 @@ typedef struct {
 	int32_t target_dist;
 	uint32_t target_hash;
 	uint32_t meta:30, check_hash:1, inner:1;
+	int32_t soft_ovlp; // the two chains overlap by more than -M allows; linked only because of --gc-mask
 	int32_t qlen;
 	// output
 	uint32_t n_path:31, is_0:1;
@@ -92,7 +93,8 @@ void mg_update_anchors(int32_t n_a, mg128_t *a, int32_t n, const int32_t *mini_p
 
 mg_pathv_t *mg_shortest_k(void *km0, const gfa_t *g, uint32_t src, int32_t n_dst, mg_path_dst_t *dst, int32_t max_dist, int32_t max_k, int32_t *n_pathv);
 int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc, int32_t qlen, int32_t max_dist_g, int32_t max_dist_q, int32_t bw, int32_t max_skip,
-					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, int32_t max_del, float del_cap, const mg128_t *an, uint64_t **u_);
+					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, int32_t max_del, float del_cap, float mask_strict, int32_t relax_min,
+					  const mg128_t *an, uint64_t **u_);
 mg_gchains_t *mg_gchain_gen(void *km_dst, void *km, const gfa_t *g, const gfa_edseq_t *es, int32_t n_u, const uint64_t *u,
 							mg_lchain_t *lc, const mg128_t *a, uint32_t hash, int32_t min_gc_cnt, int32_t min_gc_score,
 							int32_t gdp_max_ed, int32_t gdp_drop, int32_t n_seg, const char *qseq, int n_threads);

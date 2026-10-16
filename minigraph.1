@@ -343,6 +343,23 @@ value]. Raising it lets two chains share a duplicated breakpoint region. Linear
 chaining and the primary/secondary decision still use
 .BR -M .
 .TP
+.BI --gc-relax-min \ NUM
+Allow the overlap that
+.B --gc-mask
+adds above
+.B -M
+only for graph-chaining links whose length difference (indel) is at least
+.I NUM
+bp [0, any link]. In a tandem array, the extra overlap can let a small
+copy-number change chain onto a different repeat unit; this keeps the extra
+overlap for long events only. It measures the net length difference of the
+link, not the repeat unit, so a change of several units that adds up to
+.I NUM
+bp still gets the extra overlap. No effect unless
+.B --gc-mask
+is above
+.BR -M .
+.TP
 .B --ggs-self-ovlp
 With
 .BR -c ,

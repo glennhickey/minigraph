@@ -60,6 +60,7 @@ static ko_longopt_t long_options[] = {
 	{ "gc-mask",      ko_required_argument, 337 },
 	{ "ggs-self-ovlp", ko_no_argument,      338 },
 	{ "ggs-cnv",      ko_no_argument,       339 },
+	{ "gc-relax-min", ko_required_argument, 341 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -200,6 +201,10 @@ int main(int argc, char *argv[])
 		else if (c == 336) opt.gc_del_cap = atof(o.arg);     // --gc-del-cap
 		else if (c == 337) opt.gc_mask_level = atof(o.arg);  // --gc-mask
 		else if (c == 338) gpt.flag |= MG_G_SELF_OVLP;       // --ggs-self-ovlp
+		else if (c == 341) { // --gc-relax-min
+			int64_t x = mm_parse_num(o.arg);
+			opt.gc_relax_min = x < 0 || x > INT32_MAX? -1 : x; // rejected by mg_opt_check()
+		}
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -307,6 +312,9 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    --gc-mask FLOAT\n");
 		fprintf(fp_help, "                 graph chaining: max overlap between two linked chains, on the query and, within one\n");
 		fprintf(fp_help, "                 segment, on the graph, as a fraction of the shorter chain; negative for -M [%g]\n", opt.gc_mask_level);
+		fprintf(fp_help, "    --gc-relax-min NUM\n");
+		fprintf(fp_help, "                 graph chaining: allow overlap above -M (up to --gc-mask) only for links whose indel is\n");
+		fprintf(fp_help, "                 at least NUM bp; 0 for any link [%d]\n", opt.gc_relax_min);
 		fprintf(fp_help, "    --ggs-self-ovlp\n");
 		fprintf(fp_help, "                 with -c, insert a variant even where its own chain passes the graph twice (a copy\n");
 		fprintf(fp_help, "                 gain); the two passes may add near-identical alleles to one bubble\n");

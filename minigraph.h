@@ -74,6 +74,7 @@ typedef struct {
 	int gc_max_del;      // graph chaining: allow a link between chains that touch or overlap on the query up to this length difference; <= bw_long has no effect
 	float gc_del_cap;    // graph chaining: cap the linear gap cost of such a link; negative to disable
 	float gc_mask_level; // graph chaining: overlap allowed between linked chains; negative to use mask_level
+	int gc_relax_min;    // graph chaining: overlap beyond mask_level is allowed only for links whose length difference is at least this
 	int sub_diff;
 	int best_n;
 	float pri_ratio;

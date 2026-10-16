@@ -38,7 +38,7 @@ static int32_t mg_target_dist(const gfa_t *g, const mg_lchain_t *l0, const mg_lc
 }
 
 static inline int32_t cal_sc(const mg_path_dst_t *dj, const mg_lchain_t *li, const mg_lchain_t *lc, const mg128_t *an, const gc_frag_t *a, const int32_t *f,
-							 int bw, int ref_bonus, float chn_pen_gap, int32_t max_del, float del_cap)
+							 int bw, int ref_bonus, float chn_pen_gap, int32_t max_del, float del_cap, int32_t relax_min)
 {
 	const mg_lchain_t *lj;
 	int32_t gap, sc, segi, segj;
@@ -49,6 +49,7 @@ static inline int32_t cal_sc(const mg_path_dst_t *dj, const mg_lchain_t *li, con
 	lj = &lc[a[dj->meta].i];
 	segj = (an[lj->off + lj->cnt - 1].y & MG_SEED_SEG_MASK) >> MG_SEED_SEG_SHIFT;
 	if (gap < 0) gap = -gap;
+	if (dj->soft_ovlp && gap < relax_min) return INT32_MIN; // overlap beyond -M only for a long enough indel
 	if (segi == segj && gap > bw) { // with max_del, a deletion whose chains touch or overlap on the query (breakpoint homology) may skip up to max_del
 		if (max_del <= bw || gap > max_del || li->qs > lj->qe)
 			return INT32_MIN;
@@ -66,7 +67,8 @@ static inline int32_t cal_sc(const mg_path_dst_t *dj, const mg_lchain_t *li, con
 }
 
 int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc, int32_t qlen, int32_t max_dist_g, int32_t max_dist_q, int32_t bw, int32_t max_skip,
-					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, int32_t max_del, float del_cap, const mg128_t *an, uint64_t **u_)
+					  int32_t ref_bonus, float chn_pen_gap, float chn_pen_skip, float mask_level, int32_t max_del, float del_cap, float mask_strict, int32_t relax_min,
+					  const mg128_t *an, uint64_t **u_)
 {
 	int32_t i, j, k, m_dst, n_dst, n_ext, n_u, n_v, n_lc = *n_lc_;
 	int32_t *f, *v, *t;
@@ -126,12 +128,13 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 				gc_frag_t *aj = &a[j];
 				mg_lchain_t *lj = &lc[aj->i];
 				mg_path_dst_t *q;
-				int32_t target_dist, segj, dq;
+				int32_t target_dist, segj, dq, soft = 0;
 				if (lj->qs >= li->qs) continue; // lj is contained in li on the query coordinate
 				if (lj->qe > li->qs) { // test overlap on the query
 					int o = lj->qe - li->qs;
 					if (o > (lj->qe - lj->qs) * mask_level || o > (li->qe - li->qs) * mask_level)
 						continue;
+					if (o > (lj->qe - lj->qs) * mask_strict || o > (li->qe - li->qs) * mask_strict) soft = 1; // allowed by --gc-mask only
 				}
 				dq = li->qs - lj->qe;
 				segj = (an[lj->off + lj->cnt - 1].y & MG_SEED_SEG_MASK) >> MG_SEED_SEG_SHIFT;
@@ -156,6 +159,7 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 						int o = lj->re - li->rs;
 						if (o > (lj->re - lj->rs) * mask_level || o > (li->re - li->rs) * mask_level)
 							continue;
+						if (o > (lj->re - lj->rs) * mask_strict || o > (li->re - li->rs) * mask_strict) soft = 1;
 					}
 					target_dist = mg_target_dist(g, lj, li);
 				}
@@ -163,6 +167,7 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 				q = &dst[n_dst++];
 				memset(q, 0, sizeof(mg_path_dst_t));
 				q->inner = (li->v == lj->v);
+				q->soft_ovlp = soft;
 				q->v = lj->v^1;
 				q->meta = j;
 				q->qlen = li->qs - lj->qe;
@@ -185,7 +190,7 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 				mg_path_dst_t *dj = &dst[j];
 				int32_t sc;
 				if (dj->n_path == 0) continue; // not reachable
-				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap, max_del, del_cap);
+				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap, max_del, del_cap, relax_min);
 				if (sc == INT32_MIN) continue; // out of band
 				if (sc + li->score < 0) continue; // negative score and too low
 				dst[k++] = dst[j];
@@ -198,7 +203,7 @@ int32_t mg_gchain1_dp(void *km, const gfa_t *g, int32_t *n_lc_, mg_lchain_t *lc,
 			for (j = 0; j < n_dst; ++j) {
 				mg_path_dst_t *dj = &dst[j];
 				int32_t sc;
-				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap, max_del, del_cap);
+				sc = cal_sc(dj, li, lc, an, a, f, bw, ref_bonus, chn_pen_gap, max_del, del_cap, relax_min);
 				if (sc == INT32_MIN) continue;
 				if (mg_dbg_flag & MG_DBG_GC1) {
 					mg_lchain_t *lj = &lc[a[dj->meta].i];

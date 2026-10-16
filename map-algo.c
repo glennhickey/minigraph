@@ -523,7 +523,8 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
 		l += qlens[i];
 	}
 	n_gc = mg_gchain1_dp(b->km, gi->g, &n_lc, lc, qlen_sum, opt->bw_long, opt->bw_long, opt->bw_long, opt->max_gc_skip, opt->ref_bonus,
-						 chn_pen_gap, chn_pen_skip, opt->gc_mask_level >= 0.0f? opt->gc_mask_level : opt->mask_level, opt->gc_max_del, opt->gc_del_cap, a, &u);
+						 chn_pen_gap, chn_pen_skip, opt->gc_mask_level >= 0.0f? opt->gc_mask_level : opt->mask_level, opt->gc_max_del, opt->gc_del_cap,
+						 opt->mask_level, opt->gc_relax_min, a, &u);
 	if (mg_dbg_flag & MG_DBG_QNAME) t = print_time(t, 3, qname);
 	gcs[0] = mg_gchain_gen(0, b->km, gi->g, gi->es, n_gc, u, lc, a, hash, opt->min_gc_cnt, opt->min_gc_score, opt->gdp_max_ed, opt->gdp_drop, n_segs, seq_cat,
 						   mg_par_threads(b, opt, qlen_sum)); // the gap-count threshold is inside
