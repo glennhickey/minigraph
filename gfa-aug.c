@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
 #include "gfa-priv.h"
 #include "ksort.h"
 
@@ -32,15 +34,65 @@ static inline void create_first_arc(gfa_t *g, const gfa_seg_t *seg, uint32_t v, 
 	create_first_arc_semi(g, seg, w^1, v^1, rank, link_id, 1);
 }
 
-void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins, int32_t n_ctg, const char *const* name, const char *const* seq)
+typedef struct {
+	gfa_ins_t ins;
+	const char *iseq; // the inserted sequence: ins.coff[1] - ins.coff[0] bytes of its contig
+	const char *name; // the name of that contig
+} gfa_ins_key_t;
+
+static int gfa_ins_key_cmp(const void *a_, const void *b_)
+{
+	const gfa_ins_key_t *a = (const gfa_ins_key_t*)a_, *b = (const gfa_ins_key_t*)b_;
+	int32_t k, la = a->ins.coff[1] - a->ins.coff[0], lb = b->ins.coff[1] - b->ins.coff[0];
+	int c;
+	for (k = 0; k < 2; ++k) {
+		if (a->ins.v[k] != b->ins.v[k]) return a->ins.v[k] < b->ins.v[k]? -1 : 1;
+		if (a->ins.voff[k] != b->ins.voff[k]) return a->ins.voff[k] < b->ins.voff[k]? -1 : 1;
+	}
+	if (la != lb) return la < lb? -1 : 1;
+	if (la > 0 && (c = memcmp(a->iseq, b->iseq, la)) != 0) return c;
+	if ((c = strcmp(a->name, b->name)) != 0) return c;
+	if (a->ins.coff[0] != b->ins.coff[0]) return a->ins.coff[0] < b->ins.coff[0]? -1 : 1;
+	return 0;
+}
+
+/* The events of one augmentation, sorted on what they do to the graph: the two sides they
+ * attach to, then the sequence they insert, and only for otherwise identical events the name of
+ * the contig they come from.  gfa_augment() numbers the new segments and arcs in this order.
+ * The callers collect the events contig by contig, and that order would otherwise carry into the
+ * segment numbering, and from there into how later inputs break ties when they are mapped to
+ * the graph: permuting the contigs of one input file gave the same graph under other segment
+ * names, and then a different graph some hundred files later. */
+static gfa_ins_t *gfa_ins_sort(int32_t n_ins, const gfa_ins_t *ins, const char *const* name, const char *const* seq)
+{
+	int32_t i;
+	gfa_ins_key_t *key;
+	gfa_ins_t *sorted;
+	GFA_MALLOC(key, n_ins);
+	for (i = 0; i < n_ins; ++i) {
+		key[i].ins = ins[i];
+		key[i].iseq = &seq[ins[i].ctg][ins[i].coff[0]];
+		key[i].name = name[ins[i].ctg];
+	}
+	qsort(key, n_ins, sizeof(gfa_ins_key_t), gfa_ins_key_cmp);
+	GFA_MALLOC(sorted, n_ins);
+	for (i = 0; i < n_ins; ++i)
+		sorted[i] = key[i].ins;
+	free(key);
+	return sorted;
+}
+
+void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins0, int32_t n_ctg, const char *const* name, const char *const* seq)
 {
 	int32_t i, j, k, *scnt, *soff, n_ctg_seg, n_old_seg, n_seg;
 	gfa_split_t *sp;
 	gfa_seg_t *seg;
+	gfa_ins_t *ins;
 	char buf[16];
 	uint64_t t, n_old_arc = g->n_arc, *ins_side, *oldcnt;
 
 	if (n_ins <= 0 || n_ctg <= 0) return;
+	ins = gfa_ins_sort(n_ins, ins0, name, seq);
 
 	// set soff[]
 	GFA_CALLOC(scnt, g->n_seg);
@@ -174,6 +226,7 @@ void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins, int32_t n_ctg, c
 		}
 	}
 	free(ins_side);
+	free(ins);
 
 	// update *g
 	for (j = 0; j < g->n_seg; ++j) {
