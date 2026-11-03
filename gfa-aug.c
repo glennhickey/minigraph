@@ -97,7 +97,8 @@ void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins0, int32_t n_ctg, 
 	// set soff[]
 	GFA_CALLOC(scnt, g->n_seg);
 	for (i = 0; i < n_ins; ++i)
-		++scnt[ins[i].v[0]>>1], ++scnt[ins[i].v[1]>>1];
+		for (k = 0; k < 2; ++k)
+			if (ins[i].v[k] != GFA_INS_NONE) ++scnt[ins[i].v[k]>>1];
 	GFA_MALLOC(soff, g->n_seg + 1);
 	for (j = 1, soff[0] = 0; j <= g->n_seg; ++j)
 		soff[j] = soff[j-1] + scnt[j-1];
@@ -108,8 +109,11 @@ void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins0, int32_t n_ctg, 
 	for (i = 0, n_ctg_seg = 0; i < n_ins; ++i) {
 		const gfa_ins_t *p = &ins[i];
 		for (k = 0; k < 2; ++k) {
-			uint32_t vlen = g->seg[p->v[k]>>1].len;
-			gfa_split_t *q = &sp[soff[p->v[k]>>1] + scnt[p->v[k]>>1]];
+			uint32_t vlen;
+			gfa_split_t *q;
+			if (p->v[k] == GFA_INS_NONE) continue; // a one-sided insert splits nothing on its open end
+			vlen = g->seg[p->v[k]>>1].len;
+			q = &sp[soff[p->v[k]>>1] + scnt[p->v[k]>>1]];
 			q->ins = i, q->end = k;
 			q->side = (p->v[k]&1? vlen - p->voff[k] : p->voff[k]) << 1 | ((p->v[k]&1) ^ k);
 			assert(q->side != (0<<1|0) && q->side != (vlen<<1|1)); // not possible to link such sides
@@ -218,10 +222,11 @@ void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins0, int32_t n_ctg, 
 			t->soff = p->coff[0];
 			t->rank = g->max_rank + 1; // TODO: to deal with SN/SO/SR tags somewhere
 			gfa_sseq_update(g, t);
-			create_first_arc(g, seg, ins_side[i]>>32, (uint32_t)k<<1, t->rank);
-			create_first_arc(g, seg, (uint32_t)k<<1, (uint32_t)ins_side[i], t->rank);
+			if (p->v[0] != GFA_INS_NONE) create_first_arc(g, seg, ins_side[i]>>32, (uint32_t)k<<1, t->rank);
+			if (p->v[1] != GFA_INS_NONE) create_first_arc(g, seg, (uint32_t)k<<1, (uint32_t)ins_side[i], t->rank);
 			++k;
 		} else { // a pure deletion
+			assert(p->v[0] != GFA_INS_NONE && p->v[1] != GFA_INS_NONE);
 			create_first_arc(g, seg, ins_side[i]>>32, (uint32_t)ins_side[i], g->max_rank + 1);
 		}
 	}
@@ -273,8 +278,23 @@ int gfa_ins_adj(const gfa_t *g, int pen, gfa_ins_t *ins, const char *seq) // min
 	return tot;
 }
 
+// shrink a one-sided insert (one of ins->v[] is GFA_INS_NONE) from its attached end only
+int gfa_ins_adj1(const gfa_t *g, int pen, gfa_ins_t *ins, const char *seq)
+{
+	int32_t l;
+	if (ins->v[1] == GFA_INS_NONE) {
+		l = gfa_ins_shrink_semi(g, pen, ins->v[0], ins->voff[0], ins->coff[0], GFA_INS_NONE, -1, ins->coff[1], seq);
+		ins->voff[0] += l, ins->coff[0] += l;
+	} else {
+		l = gfa_ins_shrink_semi(g, pen, ins->v[1], ins->voff[1] - 1, ins->coff[1] - 1, GFA_INS_NONE, -1, ins->coff[0] - 1, seq);
+		ins->voff[1] -= l, ins->coff[1] -= l;
+	}
+	return l;
+}
+
 static inline int check_multi(const gfa_t *g, const gfa_ins_t *ins)
 {
+	if (ins->v[0] == GFA_INS_NONE || ins->v[1] == GFA_INS_NONE) return 0;
 	if (ins->v[0] != ins->v[1] && ins->coff[1] - ins->coff[0] == 0) {
 		const gfa_seg_t *s[2];
 		uint32_t v[2];
@@ -294,9 +314,14 @@ int32_t gfa_ins_filter(const gfa_t *g, int32_t n_ins, gfa_ins_t *ins) // filter 
 	int32_t i, k, n;
 	for (i = 0, n = 0; i < n_ins; ++i) {
 		gfa_ins_t *p = &ins[i];
+		if (p->v[0] == GFA_INS_NONE || p->v[1] == GFA_INS_NONE) { // a one-sided insert needs an attached end and sequence
+			if (p->v[0] == p->v[1] || p->coff[1] <= p->coff[0]) continue;
+		}
 		for (k = 0; k < 2; ++k) {
-			uint32_t vlen = g->seg[p->v[k]>>1].len;
-			uint32_t side = (p->v[k]&1? vlen - p->voff[k] : p->voff[k]) << 1 | ((p->v[k]&1) ^ k);
+			uint32_t vlen, side;
+			if (p->v[k] == GFA_INS_NONE) continue;
+			vlen = g->seg[p->v[k]>>1].len;
+			side = (p->v[k]&1? vlen - p->voff[k] : p->voff[k]) << 1 | ((p->v[k]&1) ^ k);
 			if (side == (0<<1|0) || side == (vlen<<1|1))
 				break;
 		}
@@ -304,7 +329,8 @@ int32_t gfa_ins_filter(const gfa_t *g, int32_t n_ins, gfa_ins_t *ins) // filter 
 			if (gfa_verbose >= 2)
 				fprintf(stderr, "[W::%s] %s between %c%s and %c%s derived from the %d-th query at %d-%d\n",
 						__func__, k != 2? "impossible insert" : "multi-link",
-						"><"[p->v[0]&1], g->seg[p->v[0]>>1].name, "><"[p->v[1]&1], g->seg[p->v[1]>>1].name, p->ctg, p->coff[0], p->coff[1]);
+						"><"[p->v[0]&1], p->v[0] == GFA_INS_NONE? "*" : g->seg[p->v[0]>>1].name,
+						"><"[p->v[1]&1], p->v[1] == GFA_INS_NONE? "*" : g->seg[p->v[1]>>1].name, p->ctg, p->coff[0], p->coff[1]);
 			continue;
 		}
 		ins[n++] = ins[i];

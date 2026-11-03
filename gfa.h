@@ -114,6 +114,8 @@ typedef struct {
 	int32_t coff[2], ctg;
 } gfa_ins_t;
 
+#define GFA_INS_NONE ((uint32_t)-1) // in gfa_ins_t::v[]: this end is not attached to the graph, so the new segment is a tip there
+
 extern int gfa_verbose;
 extern unsigned char gfa_comp_table[256];
 

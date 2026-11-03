@@ -60,6 +60,11 @@ static ko_longopt_t long_options[] = {
 	{ "gc-mask",      ko_required_argument, 337 },
 	{ "ggs-self-ovlp", ko_no_argument,      338 },
 	{ "ggs-cnv",      ko_no_argument,       339 },
+	{ "ggs-ends",     ko_no_argument,       342 },
+	{ "ggs-end-dist", ko_required_argument, 343 },
+	{ "ggs-end-min",  ko_required_argument, 344 },
+	{ "ggs-end-max",  ko_required_argument, 345 },
+	{ "ggs-end-telo", ko_required_argument, 346 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -200,6 +205,11 @@ int main(int argc, char *argv[])
 		else if (c == 336) opt.gc_del_cap = atof(o.arg);     // --gc-del-cap
 		else if (c == 337) opt.gc_mask_level = atof(o.arg);  // --gc-mask
 		else if (c == 338) gpt.flag |= MG_G_SELF_OVLP;       // --ggs-self-ovlp
+		else if (c == 342) gpt.flag |= MG_G_ENDS;            // --ggs-ends
+		else if (c == 343) gpt.ggs_tip_dist = mm_parse_num(o.arg); // --ggs-end-dist
+		else if (c == 344) gpt.ggs_tip_min = mm_parse_num(o.arg); // --ggs-end-min
+		else if (c == 345) gpt.ggs_tip_max = mm_parse_num(o.arg); // --ggs-end-max
+		else if (c == 346) gpt.ggs_tip_telo = mm_parse_num(o.arg); // --ggs-end-telo
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -312,6 +322,17 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "                 gain); the two passes may add near-identical alleles to one bubble\n");
 		fprintf(fp_help, "    --ggs-cnv    --gc-max-del 300000 --gc-del-cap 10000 --gc-mask 0.95 --ggs-self-ovlp, for graph\n");
 		fprintf(fp_help, "                 generation with -c, not for mapping; explicit --gc-* options override it\n");
+		fprintf(fp_help, "    --ggs-ends   with -c, add a query's overhang near a chromosome end of the graph as a tip attached\n");
+		fprintf(fp_help, "                 at one side (an end event); the query end must be telomeric (see --ggs-end-telo)\n");
+		fprintf(fp_help, "    --ggs-end-dist NUM\n");
+		fprintf(fp_help, "                 end events: max distance from the attachment to the graph's chromosome end [%d]\n", gpt.ggs_tip_dist);
+		fprintf(fp_help, "    --ggs-end-min NUM\n");
+		fprintf(fp_help, "                 end events: min overhang length, not counting the telomeric run at the query end [%d]\n", gpt.ggs_tip_min);
+		fprintf(fp_help, "    --ggs-end-max NUM\n");
+		fprintf(fp_help, "                 end events: max overhang length [%d]\n", gpt.ggs_tip_max);
+		fprintf(fp_help, "    --ggs-end-telo NUM\n");
+		fprintf(fp_help, "                 end events: the query's outer NUM bp must be at least half TTAGGG repeats (CCCTAA\n");
+		fprintf(fp_help, "                 at its start); 0 to not check [%d]\n", gpt.ggs_tip_telo);
 		fprintf(fp_help, "  Input/output:\n");
 		fprintf(fp_help, "    -t INT       number of threads [%d]\n", n_threads);
 		fprintf(fp_help, "    -o FILE      output mappings to FILE [stdout]\n");
