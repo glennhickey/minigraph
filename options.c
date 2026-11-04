@@ -67,6 +67,10 @@ void mg_ggopt_init(mg_ggopt_t *go)
 	go->ggs_shrink_pen = 9;
 	go->ggs_min_end_cnt = 10;
 	go->ggs_min_end_frac = 0.1f;
+	go->ggs_tip_dist = 1000000;
+	go->ggs_tip_min = 10000;
+	go->ggs_tip_max = 1000000;
+	go->ggs_tip_telo = 1000;
 	go->ggs_max_iden = 0.80f;
 	go->ggs_min_inv_iden = 0.95f;
 }

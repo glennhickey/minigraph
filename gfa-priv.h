@@ -124,6 +124,7 @@ gfa_sub_t *gfa_scc1(void *km0, const gfa_t *g, gfa_scbuf_t *b, uint32_t v0);
 void gfa_scbuf_destroy(gfa_scbuf_t *b);
 
 // graph augmentation
+int gfa_ins_adj1(const gfa_t *g, int pen, gfa_ins_t *ins, const char *seq);
 int gfa_ins_adj(const gfa_t *g, int min_len, gfa_ins_t *ins, const char *seq);
 int32_t gfa_ins_filter(const gfa_t *g, int32_t n_ins, gfa_ins_t *ins);
 void gfa_augment(gfa_t *g, int32_t n_ins, const gfa_ins_t *ins, int32_t n_ctg, const char *const* name, const char *const* seq);

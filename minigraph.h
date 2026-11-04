@@ -39,6 +39,7 @@
 #define MG_G_NO_INV       0x4
 #define MG_G_CALL         0x8
 #define MG_G_SELF_OVLP    0x10
+#define MG_G_ENDS         0x20 // with -c, add a query's overhang past a reference chromosome end as a one-sided tip (an end event)
 
 typedef struct { uint64_t x, y; } mg128_t;
 typedef struct { size_t n, m; mg128_t *a; } mg128_v;
@@ -94,6 +95,10 @@ typedef struct {
 	int ggs_shrink_pen;
 	int ggs_min_end_cnt;
 	float ggs_min_end_frac;
+	int ggs_tip_dist;    // end events: the attachment must be within this many bp of the reference chromosome end
+	int ggs_tip_min;     // end events: min overhang length beyond the query's telomere repeat
+	int ggs_tip_max;     // end events: max overhang length
+	int ggs_tip_telo;    // end events: the query end must be telomeric over this many outer bp; 0 to not check
 	// scoring for SW check
 	float ggs_max_iden, ggs_min_inv_iden;
 } mg_ggopt_t;

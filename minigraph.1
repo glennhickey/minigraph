@@ -372,6 +372,71 @@ the combination tested on the AMY1/AMY2 locus of chr1. Explicit
 options override it, in any order. The chaining part changes mappings as well,
 so do not use it to map to the finished graph.
 .TP
+.B --ggs-ends
+With
+.BR -c ,
+add end events [off]. Graph generation inserts only sequence between two
+anchors of a chain, and none close to the ends of a query, so where a haplotype's chromosome end differs from the graph's, as when
+its terminal subtelomeric block is a copy of another chromosome's, the block
+stays out of the graph, and its carriers map it to the other chromosome or not
+at all. An end event adds the overhang of a confident primary chain, the part
+of the query past its last or before its first anchor, as a new segment
+attached to the graph at one side only: a tip forking off next to the graph's
+own chromosome end. An event needs all of the following:
+.RS
+.IP \(bu 2
+the query end is telomeric (see
+.BR --ggs-end-telo );
+.IP \(bu 2
+the overhang is at most
+.B --ggs-end-max
+bp long, at least
+.B --ggs-end-min
+bp of it are beyond the telomeric run at the query end, and it has no N;
+.IP \(bu 2
+walking on from the attachment along the graph reaches a tip within
+.B --ggs-end-dist
+bp, and the attachment is not that tip itself;
+.IP \(bu 2
+no confident chain of the query lies on that walk, which would make the
+overhang the graph's own end with something inserted inside it;
+.IP \(bu 2
+no higher-scoring chain of the query, and no other confident one, crosses into
+the overhang, and no other confident chain of the batch covers the 1 kb inward
+of the attachment;
+.IP \(bu 2
+where the overhang and the walk to the tip have similar lengths, the overhang
+differs from the graph's end, as for other events (on up to 10 kb).
+.RE
+.IP
+A lower-scoring chain of the query that lies mostly within the overhang, such
+as the overhang aligned to another chromosome's end, would have been a
+secondary had the overhang been aligned; it is dropped from graph generation.
+If another query's chain vetoes the event, the chain is kept, and the other
+events are tested again with it.
+Without
+.B -c
+it has no effect.
+.TP
+.BI --ggs-end-dist \ NUM
+End events: max distance from the attachment to the graph's chromosome end
+[1000000].
+.TP
+.BI --ggs-end-min \ NUM
+End events: min overhang length, not counting the telomeric run at the query
+end [10000].
+.TP
+.BI --ggs-end-max \ NUM
+End events: max overhang length [1000000].
+.TP
+.BI --ggs-end-telo \ NUM
+End events: the outer
+.I NUM
+bp of the query end must be at least half TTAGGG repeats (CCCTAA at the start
+of the query), as a telomere reads [1000]. 0 accepts any query end, and then
+the telomeric run does not count against
+.BR --ggs-end-min .
+.TP
 .B --cov
 Remap and generate segment and link use frequencies. This option triggers GFA
 output. When used with
