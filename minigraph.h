@@ -99,6 +99,8 @@ typedef struct {
 	int ggs_tip_min;     // end events: min overhang length beyond the query's telomere repeat
 	int ggs_tip_max;     // end events: max overhang length
 	int ggs_tip_telo;    // end events: the query end must be telomeric over this many outer bp; 0 to not check
+	float ggs_tip_max_lrep; // end events: max fraction of the overhang (telomeric run excluded) in long-period repeat; 0 to not check
+	int ggs_tip_lrep_dist;  // end events: a 19-mer is long-period repeat if its nearest other copy in the overhang is at least this far
 	// scoring for SW check
 	float ggs_max_iden, ggs_min_inv_iden;
 } mg_ggopt_t;

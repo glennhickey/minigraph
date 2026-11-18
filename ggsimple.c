@@ -513,6 +513,38 @@ static int32_t gg_telo_len(const char *s, int32_t l, int right)
 	return x;
 }
 
+// the fraction of the 19-mers of s[st,en) whose nearest other occurrence in s[st,en) is at least min_dist bp away: near 1
+// for an array of a long unit (D4Z4, 3.3kb; rDNA; satellite HORs), near 0 for unique sequence and for short-period
+// repeats (telomere, VNTRs), whose copies are closer than min_dist.  It reads s[st,en) only, not the graph
+static float gg_lrep_frac(void *km, const char *s, int32_t st, int32_t en, int32_t min_dist)
+{
+	const int32_t k = 19, sh = 26; // a 38-bit 19-mer and a 26-bit position share a 64-bit word
+	const uint64_t mask = (1ULL<<(2*k)) - 1, pmask = (1ULL<<sh) - 1;
+	uint64_t x = 0, *a;
+	int32_t i, j, j0, l = 0, n = 0, n_lrep = 0;
+	if (en - st < k || (uint64_t)(en - st) > pmask) return 0.0f;
+	KMALLOC(km, a, en - st);
+	for (i = st; i < en; ++i) {
+		int c = seq_nt4_table[(uint8_t)s[i]];
+		if (c > 3) { l = 0, x = 0; continue; }
+		x = (x << 2 | c) & mask;
+		if (++l >= k) a[n++] = x << sh | (uint64_t)(i - st);
+	}
+	radix_sort_gfa64(a, a + n); // by 19-mer, then by position
+	for (j0 = 0, i = 1; i <= n; ++i) {
+		if (i < n && a[i]>>sh == a[j0]>>sh) continue;
+		for (j = j0; i - j0 > 1 && j < i; ++j) { // a[j0,i): the positions of one 19-mer, ascending
+			int64_t d = INT64_MAX;
+			if (j > j0) d = (int64_t)(a[j]&pmask) - (int64_t)(a[j-1]&pmask);
+			if (j + 1 < i && (int64_t)(a[j+1]&pmask) - (int64_t)(a[j]&pmask) < d) d = (int64_t)(a[j+1]&pmask) - (int64_t)(a[j]&pmask);
+			if (d >= min_dist) ++n_lrep;
+		}
+		j0 = i;
+	}
+	kfree(km, a);
+	return n > 0? (float)n_lrep / n : 0.0f;
+}
+
 typedef struct {
 	gfa_ins_t ins;
 	gg_span_t at;           // the graph next to the attachment, inward
@@ -575,6 +607,12 @@ static void gg_end_query(void *km, const mg_ggopt_t *opt, const gfa_t *g, int32_
 			ovh -= gfa_ins_adj1(g, opt->ggs_shrink_pen, &I, s);
 			if (ovh < opt->min_var_len) GG_END_SKIP("shrunk");
 			if (ovh - telo < opt->ggs_tip_min) GG_END_SKIP("telomere-only"); // little more than a longer telomere
+			if (opt->ggs_tip_max_lrep > 0.0f) { // mostly an array of a long unit: no end event (see gg_lrep_frac())
+				int32_t rs = side == 0? I.coff[0] : I.coff[0] + telo, re = side == 0? I.coff[1] - telo : I.coff[1];
+				float lrep = gg_lrep_frac(km, s, rs, re, opt->ggs_tip_lrep_dist);
+				if (dbg) fprintf(stderr, "IR\t%s:[%d,%d) side:%d lrep:%.3f\n", seq1->name, I.coff[0], I.coff[1], side, lrep);
+				if (lrep > opt->ggs_tip_max_lrep) GG_END_SKIP("long-period-repeat");
+			}
 			if (side == 0) w = I.v[0], woff = I.voff[0];
 			else w = I.v[1]^1, woff = g->seg[I.v[1]>>1].len - I.voff[1];
 			d = gg_dist_to_tip(km, g, w, woff, opt->ggs_tip_dist, &b->sp, &b->n_sp, &b->m_sp);

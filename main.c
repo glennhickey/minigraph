@@ -65,6 +65,7 @@ static ko_longopt_t long_options[] = {
 	{ "ggs-end-min",  ko_required_argument, 344 },
 	{ "ggs-end-max",  ko_required_argument, 345 },
 	{ "ggs-end-telo", ko_required_argument, 346 },
+	{ "ggs-end-max-lrep", ko_required_argument, 347 },
 	{ "no-kalloc",    ko_no_argument,       401 },
 	{ "dbg-qname",    ko_no_argument,       402 },
 	{ "dbg-lchain",   ko_no_argument,       403 },
@@ -210,6 +211,7 @@ int main(int argc, char *argv[])
 		else if (c == 344) gpt.ggs_tip_min = mm_parse_num(o.arg); // --ggs-end-min
 		else if (c == 345) gpt.ggs_tip_max = mm_parse_num(o.arg); // --ggs-end-max
 		else if (c == 346) gpt.ggs_tip_telo = mm_parse_num(o.arg); // --ggs-end-telo
+		else if (c == 347) gpt.ggs_tip_max_lrep = atof(o.arg);     // --ggs-end-max-lrep
 		else if (c == 401) mg_dbg_flag |= MG_DBG_NO_KALLOC;   // --no-kalloc
 		else if (c == 402) mg_dbg_flag |= MG_DBG_QNAME;       // --dbg-qname
 		else if (c == 403) mg_dbg_flag |= MG_DBG_LCHAIN;      // --dbg-lchain
@@ -333,6 +335,10 @@ int main(int argc, char *argv[])
 		fprintf(fp_help, "    --ggs-end-telo NUM\n");
 		fprintf(fp_help, "                 end events: the query's outer NUM bp must be at least half TTAGGG repeats (CCCTAA\n");
 		fprintf(fp_help, "                 at its start); 0 to not check [%d]\n", gpt.ggs_tip_telo);
+		fprintf(fp_help, "    --ggs-end-max-lrep FLOAT\n");
+		fprintf(fp_help, "                 end events: skip an overhang (its telomeric run excluded) of which more than FLOAT\n");
+		fprintf(fp_help, "                 is long-period repeat, i.e. 19-mers whose nearest other copy in it is at least %d bp\n", gpt.ggs_tip_lrep_dist);
+		fprintf(fp_help, "                 away (an array of a long unit such as D4Z4); 0 to not check [%g]\n", gpt.ggs_tip_max_lrep);
 		fprintf(fp_help, "  Input/output:\n");
 		fprintf(fp_help, "    -t INT       number of threads [%d]\n", n_threads);
 		fprintf(fp_help, "    -o FILE      output mappings to FILE [stdout]\n");
